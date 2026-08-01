@@ -439,6 +439,12 @@ impl DocHost {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
                 }
                 let harness = self.harness_for(chat_id);
+                if !request.document_refs.is_empty() {
+                    eprintln!(
+                        "Aurin Comet dispatch: harness={harness:?}, document refs={}",
+                        request.document_refs.len()
+                    );
+                }
                 let mut request = request.clone();
                 request.context = context_turns(&handle.doc.read_entries().unwrap_or_default());
                 sessions
