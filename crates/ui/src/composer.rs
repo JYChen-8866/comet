@@ -13,12 +13,13 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PaintQuad, PathPromptOptions, Pixels, Point, SharedString, Style, StyledImage as _,
-    Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine,
-    actions, div, fill, img, point, prelude::*, px, relative, size,
+    App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
+    SharedString, Style, StyledImage as _, Subscription, Task, TextRun, TextStyle, UTF16Selection,
+    TransformationMatrix, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
+    prelude::*, px, quad, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -64,6 +65,9 @@ pub const MIN_COMPACT_INPUT_WIDTH: f32 = 200.0;
 /// Input text metrics: `text-[14px] leading-relaxed` = 14 × 1.625 = 22.75.
 pub const INPUT_LINE_HEIGHT: f32 = 22.75;
 pub const INPUT_TEXT_SIZE: f32 = 14.0;
+/// Horizontal/vertical padding around an inline mention pill.
+pub const MENTION_PILL_PAD_X: f32 = 6.0;
+pub const MENTION_PILL_PAD_Y: f32 = 2.0;
 /// Single-select questions auto-advance after this long.
 pub const AUTO_ADVANCE_MS: u64 = 220;
 
@@ -136,10 +140,18 @@ pub fn composer_total_height(content_height: f32) -> f32 {
 /// Extracts Aurin document mentions from `@[title](aurin://doc/node/content)`
 /// tokens so the structured `RunRequest.document_refs` field can ride beside
 /// the persisted text.
-fn document_refs_from_text(text: &str) -> Vec<DocumentRef> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocumentMention {
+    /// Byte range of the full `@[...](aurin://doc/...)` token in the raw content.
+    range: Range<usize>,
+    title: String,
+    node_id: String,
+    content_id: String,
+}
+
+fn document_mentions(text: &str) -> Vec<DocumentMention> {
     const MARKER: &str = "](aurin://doc/";
-    let mut refs = Vec::new();
-    let mut seen = HashSet::new();
+    let mut mentions = Vec::new();
     for (start, _) in text.match_indices("@[") {
         let title_start = start + 2;
         let Some(title_len) = text[title_start..].find(']') else {
@@ -158,16 +170,108 @@ fn document_refs_from_text(text: &str) -> Vec<DocumentRef> {
         let (Some(node_id), Some(content_id)) = (ids.next(), ids.next()) else {
             continue;
         };
-        if !seen.insert(content_id.to_owned()) {
-            continue;
-        }
-        refs.push(DocumentRef {
+        mentions.push(DocumentMention {
+            range: start..id_end + 1,
+            title: text[title_start..title_end].to_owned(),
             node_id: node_id.to_owned(),
             content_id: content_id.to_owned(),
-            title: text[title_start..title_end].to_owned(),
         });
     }
-    refs
+    mentions
+}
+
+fn document_refs_from_text(text: &str) -> Vec<DocumentRef> {
+    comet_proto::document_refs_from_text(text)
+}
+
+/// Builds the visually collapsed composer text: each raw mention token becomes
+/// an `@title` pill, plus the byte-offset maps used to translate caret,
+/// selection, and mouse positions back to the raw content.
+fn mention_display_mapping(
+    content: &str,
+    mentions: &[DocumentMention],
+) -> (String, Vec<usize>, Vec<usize>, Vec<Range<usize>>) {
+    let mut display = String::with_capacity(content.len());
+    let mut content_to_display = vec![0usize; content.len() + 1];
+    let mut display_to_content = vec![0usize; 1];
+    let mut mention_ranges = Vec::with_capacity(mentions.len());
+    let mut content_cursor = 0usize;
+    let mut display_cursor = 0usize;
+
+    for mention in mentions {
+        if mention.range.start > content_cursor {
+            let segment = &content[content_cursor..mention.range.start];
+            display.push_str(segment);
+            for i in 0..=segment.len() {
+                content_to_display[content_cursor + i] = display_cursor + i;
+            }
+            for i in 0..segment.len() {
+                display_to_content.push(content_cursor + i + 1);
+            }
+            content_cursor = mention.range.start;
+            display_cursor += segment.len();
+        }
+        if mention.range.start < content_cursor {
+            continue;
+        }
+
+        // The leading space run is the icon slot painted inside the pill; the
+        // raw `@[title](aurin://doc/...)` token still persists in the message.
+        let label = format!("   {}", mention.title);
+        let label_start = display_cursor;
+        display.push_str(&label);
+        for i in mention.range.start..mention.range.end {
+            content_to_display[i] = label_start;
+        }
+        content_to_display[mention.range.end] = label_start + label.len();
+        for _ in 0..label.len().saturating_sub(1) {
+            display_to_content.push(mention.range.start);
+        }
+        display_to_content.push(mention.range.end);
+        mention_ranges.push(label_start..label_start + label.len());
+
+        content_cursor = mention.range.end;
+        display_cursor += label.len();
+    }
+
+    if content_cursor < content.len() {
+        let segment = &content[content_cursor..];
+        display.push_str(segment);
+        for i in 0..=segment.len() {
+            content_to_display[content_cursor + i] = display_cursor + i;
+        }
+        for i in 0..segment.len() {
+            display_to_content.push(content_cursor + i + 1);
+        }
+        display_cursor += segment.len();
+    }
+
+    if let Some(last) = content_to_display.last_mut() {
+        *last = display_cursor;
+    }
+    if let Some(last) = display_to_content.last_mut() {
+        *last = content.len();
+    }
+    (
+        display,
+        content_to_display,
+        display_to_content,
+        mention_ranges,
+    )
+}
+
+fn mention_before_or_at(mentions: &[DocumentMention], offset: usize) -> Option<Range<usize>> {
+    mentions
+        .iter()
+        .find(|m| m.range.start < offset && offset <= m.range.end)
+        .map(|m| m.range.clone())
+}
+
+fn mention_at_or_after(mentions: &[DocumentMention], offset: usize) -> Option<Range<usize>> {
+    mentions
+        .iter()
+        .find(|m| m.range.start <= offset && offset < m.range.end)
+        .map(|m| m.range.clone())
 }
 
 /// Staged-attachment strip metrics (comet attachment-ui.tsx AttachmentStrip:
@@ -665,6 +769,12 @@ pub struct ComposerInput {
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
+    /// Raw-content byte offset → visually collapsed display byte offset.
+    content_to_display: Vec<usize>,
+    /// Display byte offset → raw-content byte offset (for mouse mapping).
+    display_to_content: Vec<usize>,
+    /// Display-byte ranges covered by mention pills.
+    mention_ranges: Vec<Range<usize>>,
     last_bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
     content_height: f32,
@@ -707,6 +817,9 @@ impl ComposerInput {
             scroll_top: 0.0,
             last_lines: Vec::new(),
             line_starts: vec![0],
+            content_to_display: vec![0],
+            display_to_content: vec![0],
+            mention_ranges: Vec::new(),
             last_bounds: None,
             line_height: px(INPUT_LINE_HEIGHT),
             content_height: INPUT_LINE_HEIGHT,
@@ -822,36 +935,72 @@ impl ComposerInput {
     }
 
     fn previous_boundary(&self, offset: usize) -> usize {
-        self.content
+        let mentions = document_mentions(&self.content);
+        if let Some(range) = mention_before_or_at(&mentions, offset) {
+            return range.start;
+        }
+        let prev = self
+            .content
             .grapheme_indices(true)
             .rev()
             .find_map(|(ix, _)| (ix < offset).then_some(ix))
-            .unwrap_or(0)
+            .unwrap_or(0);
+        if let Some(range) = mention_before_or_at(&mentions, prev) {
+            return range.start;
+        }
+        prev
     }
 
     fn next_boundary(&self, offset: usize) -> usize {
-        self.content
+        let mentions = document_mentions(&self.content);
+        if let Some(range) = mention_at_or_after(&mentions, offset) {
+            return range.end;
+        }
+        let next = self
+            .content
             .grapheme_indices(true)
             .find_map(|(ix, _)| (ix > offset).then_some(ix))
-            .unwrap_or(self.content.len())
+            .unwrap_or(self.content.len());
+        if let Some(range) = mention_at_or_after(&mentions, next) {
+            return range.end;
+        }
+        next
     }
 
     fn previous_word_boundary(&self, offset: usize) -> usize {
-        self.content
+        let mentions = document_mentions(&self.content);
+        if let Some(range) = mention_before_or_at(&mentions, offset) {
+            return range.start;
+        }
+        let prev = self
+            .content
             .split_word_bound_indices()
             .rev()
             .find_map(|(ix, word)| (ix < offset && !word.trim().is_empty()).then_some(ix))
-            .unwrap_or(0)
+            .unwrap_or(0);
+        if let Some(range) = mention_before_or_at(&mentions, prev) {
+            return range.start;
+        }
+        prev
     }
 
     fn next_word_boundary(&self, offset: usize) -> usize {
-        self.content
+        let mentions = document_mentions(&self.content);
+        if let Some(range) = mention_at_or_after(&mentions, offset) {
+            return range.end;
+        }
+        let next = self
+            .content
             .split_word_bound_indices()
             .find_map(|(ix, word)| {
                 let end = ix + word.len();
                 (end > offset && !word.trim().is_empty()).then_some(end)
             })
-            .unwrap_or(self.content.len())
+            .unwrap_or(self.content.len());
+        if let Some(range) = mention_at_or_after(&mentions, next) {
+            return range.end;
+        }
+        next
     }
 
     /// Byte range of the logical line containing `offset`.
@@ -1030,14 +1179,16 @@ impl ComposerInput {
 
     /// Content-local point for a byte index (y grows down from content top).
     fn point_for_index(&self, index: usize) -> Option<Point<Pixels>> {
+        let display_index = *self.content_to_display.get(index)?;
         for (line_ix, line) in self.last_lines.iter().enumerate() {
             let line_start = *self.line_starts.get(line_ix)?;
             let line_len = line.len();
-            if index < line_start {
+            if display_index < line_start {
                 continue;
             }
-            if index <= line_start + line_len {
-                let local = line.position_for_index(index - line_start, self.line_height)?;
+            if display_index <= line_start + line_len {
+                let local =
+                    line.position_for_index(display_index - line_start, self.line_height)?;
                 let y_offset: f32 = self
                     .last_lines
                     .iter()
@@ -1067,7 +1218,12 @@ impl ComposerInput {
                 let ix = line
                     .closest_index_for_position(local, self.line_height)
                     .unwrap_or_else(|ix| ix);
-                return (line_start + ix).min(self.content.len());
+                return self
+                    .display_to_content
+                    .get(line_start + ix)
+                    .copied()
+                    .unwrap_or(self.content.len())
+                    .min(self.content.len());
             }
             y -= height;
         }
@@ -1150,37 +1306,83 @@ impl ComposerInput {
     /// Shape the text at a width; store measured layout; return content height.
     /// Called from the element's measured-layout closure.
     fn layout_text(&mut self, width: Pixels, style: &TextStyle, window: &mut Window) -> f32 {
-        let (display, is_placeholder) = if self.content.is_empty() {
-            (self.placeholder.clone(), true)
+        let is_placeholder = self.content.is_empty();
+        let (display, content_to_display, display_to_content, mention_ranges) = if is_placeholder {
+            (self.placeholder.clone(), vec![0], vec![0], Vec::new())
         } else {
-            (SharedString::from(self.content.clone()), false)
+            let mentions = document_mentions(&self.content);
+            let (display, content_to_display, display_to_content, mention_ranges) =
+                mention_display_mapping(&self.content, &mentions);
+            (
+                SharedString::from(display),
+                content_to_display,
+                display_to_content,
+                mention_ranges,
+            )
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
         self.line_height = px(INPUT_LINE_HEIGHT);
 
-        let run_for = |len: usize, underline: bool| TextRun {
-            len,
-            font: style.font(),
-            color: style.color,
-            background_color: None,
-            underline: underline.then_some(UnderlineStyle {
-                color: Some(style.color),
-                thickness: px(1.0),
-                wavy: false,
-            }),
-            strikethrough: None,
+        let run_for = |len: usize, underline: bool, mention: bool| {
+            let color = if mention { gpui::white() } else { style.color };
+            TextRun {
+                len,
+                font: style.font(),
+                color,
+                background_color: None,
+                underline: underline.then_some(UnderlineStyle {
+                    color: Some(color),
+                    thickness: px(1.0),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            }
         };
-        let runs: Vec<TextRun> = match self.marked_range.as_ref() {
-            Some(marked) if !is_placeholder => vec![
-                run_for(marked.start, false),
-                run_for(marked.len(), true),
-                run_for(display.len() - marked.end, false),
-            ]
-            .into_iter()
-            .filter(|r| r.len > 0)
-            .collect(),
-            _ => vec![run_for(display.len(), false)],
+        let marked_display_range = if !is_placeholder {
+            self.marked_range.as_ref().map(|marked| {
+                let display_start = self
+                    .content_to_display
+                    .get(marked.start)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(display.len());
+                let display_end = self
+                    .content_to_display
+                    .get(marked.end)
+                    .copied()
+                    .unwrap_or(display.len())
+                    .min(display.len());
+                display_start..display_end
+            })
+        } else {
+            None
         };
+        let mut boundaries = vec![0, display.len()];
+        for range in &mention_ranges {
+            boundaries.extend([range.start, range.end]);
+        }
+        if let Some(range) = &marked_display_range {
+            boundaries.extend([range.start, range.end]);
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let runs: Vec<TextRun> = boundaries
+            .windows(2)
+            .filter_map(|pair| {
+                let start = pair[0];
+                let end = pair[1];
+                if start >= end {
+                    return None;
+                }
+                let in_mention = mention_ranges
+                    .iter()
+                    .any(|range| start >= range.start && end <= range.end);
+                let underline = marked_display_range
+                    .as_ref()
+                    .map_or(false, |range| start >= range.start && end <= range.end);
+                Some(run_for(end - start, underline, in_mention))
+            })
+            .collect();
 
         let lines = window
             .text_system()
@@ -1211,6 +1413,9 @@ impl ComposerInput {
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
+        self.content_to_display = content_to_display;
+        self.display_to_content = display_to_content;
+        self.mention_ranges = mention_ranges;
         self.content_height = content_height.max(INPUT_LINE_HEIGHT);
         self.max_line_width = if is_placeholder { 0.0 } else { max_line_width };
         self.last_width = f32::from(width);
@@ -1393,6 +1598,78 @@ impl EntityInputHandler for ComposerInput {
     }
 }
 
+/// Visual-row rectangles for the mention pills that overlap `line`, in the
+/// line's local coordinate space (relative to the composer element origin).
+fn mention_pill_rects(
+    line: &WrappedLine,
+    line_start: usize,
+    mention_ranges: &[Range<usize>],
+    origin: Point<Pixels>,
+    line_height: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    let line_len = line.len();
+    let boundaries: Vec<usize> = line
+        .wrap_boundaries()
+        .iter()
+        .map(|boundary| {
+            let run = &line.runs()[boundary.run_ix];
+            run.glyphs[boundary.glyph_ix].index
+        })
+        .collect();
+    let row_count = boundaries.len() + 1;
+    let mut rects = Vec::new();
+
+    for range in mention_ranges {
+        let raw_start = range.start.saturating_sub(line_start);
+        let raw_end = range.end.saturating_sub(line_start);
+        if raw_end == 0 || raw_start >= line_len {
+            continue;
+        }
+        let local_start = raw_start.min(line_len);
+        let local_end = raw_end.min(line_len);
+        if local_start >= local_end {
+            continue;
+        }
+
+        for row_ix in 0..row_count {
+            let row_start = if row_ix == 0 {
+                0
+            } else {
+                boundaries[row_ix - 1]
+            };
+            let row_end = if row_ix + 1 < row_count {
+                boundaries[row_ix]
+            } else {
+                line_len
+            };
+            let seg_start = local_start.max(row_start);
+            let seg_end = local_end.min(row_end);
+            if seg_start >= seg_end {
+                continue;
+            }
+            let (Some(start_pos), Some(end_pos)) = (
+                line.position_for_index(seg_start, line_height),
+                line.position_for_index(seg_end, line_height),
+            ) else {
+                continue;
+            };
+            let top =
+                origin.y + px(row_ix as f32 * f32::from(line_height)) + px(MENTION_PILL_PAD_Y);
+            let height = line_height - px(2.0 * MENTION_PILL_PAD_Y);
+            let left = origin.x + start_pos.x - px(MENTION_PILL_PAD_X);
+            let right = origin.x + end_pos.x + px(MENTION_PILL_PAD_X);
+            if right <= left {
+                continue;
+            }
+            rects.push(Bounds::from_corners(
+                point(left, top),
+                point(right, top + height),
+            ));
+        }
+    }
+    rects
+}
+
 /// The custom element: measured auto-grow layout + shaped-line painting.
 struct ComposerTextElement {
     input: Entity<ComposerInput>,
@@ -1549,15 +1826,68 @@ impl gpui::Element for ComposerTextElement {
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
-        let (lines, line_height, scroll) = self.input.update(cx, |input, _| {
-            (
-                std::mem::take(&mut input.last_lines),
-                input.line_height,
-                input.scroll_top,
-            )
-        });
+        let (lines, line_starts, mention_ranges, line_height, scroll) =
+            self.input.update(cx, |input, _| {
+                (
+                    std::mem::take(&mut input.last_lines),
+                    std::mem::take(&mut input.line_starts),
+                    input.mention_ranges.clone(),
+                    input.line_height,
+                    input.scroll_top,
+                )
+            });
 
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            let theme = Theme::of(cx);
+            let pill_bg = theme.accent;
+            let pill_border = theme.accent;
+            let pill_radius = px(0.0);
+            let mut y = bounds.top() - px(scroll);
+            let mut pill_quads = Vec::new();
+            let mut pill_rects = Vec::new();
+            for (line_ix, line) in lines.iter().enumerate() {
+                let height = line.size(line_height).height;
+                let line_start = line_starts.get(line_ix).copied().unwrap_or(0);
+                for rect in mention_pill_rects(
+                    line,
+                    line_start,
+                    &mention_ranges,
+                    point(bounds.left(), y),
+                    line_height,
+                ) {
+                    pill_rects.push(rect);
+                    pill_quads.push(quad(
+                        rect,
+                        pill_radius,
+                        pill_bg,
+                        px(1.0),
+                        pill_border,
+                        BorderStyle::default(),
+                    ));
+                }
+                y += height;
+            }
+            for pill in pill_quads {
+                window.paint_quad(pill);
+            }
+            let icon_size = px(12.0);
+            let icon_color = gpui::white();
+            for rect in pill_rects {
+                let top = rect.top() + (rect.size.height - icon_size) / 2.0;
+                let left = rect.left() + px(2.0);
+                let icon_bounds = Bounds::from_corners(
+                    point(left, top),
+                    point(left + icon_size, top + icon_size),
+                );
+                let _ = window.paint_svg(
+                    icon_bounds,
+                    SharedString::from(crate::icons::FILE),
+                    None,
+                    TransformationMatrix::unit(),
+                    icon_color,
+                    cx,
+                );
+            }
             for quad in prepaint.selection_quads.drain(..) {
                 window.paint_quad(quad);
             }
@@ -1587,6 +1917,7 @@ impl gpui::Element for ComposerTextElement {
         });
         self.input.update(cx, |input, _| {
             input.last_lines = lines;
+            input.line_starts = line_starts;
         });
     }
 }
@@ -3730,7 +4061,10 @@ mod tests {
 
 #[cfg(test)]
 mod mention_tests {
-    use super::{ComposerInput, document_refs_from_text};
+    use super::{
+        ComposerInput, document_mentions, document_refs_from_text, mention_at_or_after,
+        mention_before_or_at, mention_display_mapping,
+    };
 
     #[test]
     fn parses_single_document_mention() {
@@ -3770,5 +4104,36 @@ mod mention_tests {
     #[test]
     fn ignores_plain_text_without_mention_token() {
         assert!(document_refs_from_text("hello @world").is_empty());
+    }
+
+    #[test]
+    fn display_mapping_collapses_mention_token() {
+        let text = "@[需求文档](aurin://doc/n1/c1) hi";
+        let mentions = document_mentions(text);
+        assert_eq!(mentions.len(), 1);
+        assert_eq!(mentions[0].title, "需求文档");
+        assert_eq!(mentions[0].range, 0..text.find(" hi").unwrap());
+
+        let (display, content_to_display, display_to_content, mention_ranges) =
+            mention_display_mapping(text, &mentions);
+        let label = format!("   {}", mentions[0].title);
+        assert_eq!(display, format!("{label} hi"));
+        assert_eq!(mention_ranges, vec![0..label.len()]);
+        assert_eq!(display_to_content[label.len()], text.find(" hi").unwrap());
+        assert_eq!(content_to_display[text.find(" hi").unwrap()], label.len());
+        assert_eq!(display_to_content[display.len()], text.len());
+        assert_eq!(content_to_display[text.len()], display.len());
+    }
+
+    #[test]
+    fn mention_boundary_helpers_treat_pill_as_atomic() {
+        let text = "hi @[文档](aurin://doc/n1/c1) ok";
+        let mentions = document_mentions(text);
+        let range = mentions[0].range.clone();
+        assert_eq!(
+            mention_before_or_at(&mentions, range.end),
+            Some(range.clone())
+        );
+        assert_eq!(mention_at_or_after(&mentions, range.start), Some(range));
     }
 }

@@ -273,6 +273,12 @@ impl SessionsEngine {
 
         let harness = self.inner.registry.resolve(harness_id)?;
         let handle = self.doc_handle(chat_id)?;
+        // A document `@`-ed once stays resident for the whole chat: fold every
+        // mention from the transcript into this turn before the new message is
+        // written (the current prompt's refs are already on the request).
+        if let Ok(entries) = handle.doc().read_entries() {
+            crate::mentions::merge_resident_document_refs(&mut request, &entries);
+        }
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
@@ -561,6 +567,14 @@ impl SessionsEngine {
                 request.prompt = prompt_text;
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
+                // Rebuild the resident registry on the last-resort fallback
+                // too; the primary `last_request` path already carries the
+                // merged refs.
+                if let Ok(handle) = sessions.doc_handle(&chat_id)
+                    && let Ok(entries) = handle.doc().read_entries()
+                {
+                    crate::mentions::merge_resident_document_refs(&mut request, &entries);
+                }
                 let harness_id = host.harness_for(&chat_id);
                 match sessions
                     .dispatch(&chat_id, harness_id, request, Some(user_id))

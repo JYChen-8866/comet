@@ -1442,6 +1442,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
 struct CapturingHarness {
     script: Vec<AgentEvent>,
     seen: Arc<std::sync::Mutex<Vec<RunRequest>>>,
+    steerable: bool,
 }
 
 #[async_trait]
@@ -1453,7 +1454,7 @@ impl Harness for CapturingHarness {
         "Capturing"
     }
     fn supports_steering(&self) -> bool {
-        true
+        self.steerable
     }
     fn steering_mode(&self) -> SteeringMode {
         SteeringMode::StepBoundary
@@ -1489,6 +1490,7 @@ async fn attachment_upload_then_run_threads_refs_and_paths() {
         Arc::new(CapturingHarness {
             script: mock_script(),
             seen: seen.clone(),
+            steerable: true,
         }),
     );
     let client = comet_rpc::memory_client(core.rpc_service());
@@ -1592,6 +1594,7 @@ async fn document_refs_survive_queue_command_to_harness() {
         Arc::new(CapturingHarness {
             script: mock_script(),
             seen: seen.clone(),
+            steerable: true,
         }),
     );
     let client = comet_rpc::memory_client(core.rpc_service());
@@ -1640,6 +1643,88 @@ async fn document_refs_survive_queue_command_to_harness() {
             title: "你好我有一个帽衫".into(),
         }]
     );
+}
+
+#[tokio::test]
+async fn document_refs_stay_resident_across_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let seen: Arc<std::sync::Mutex<Vec<RunRequest>>> = Default::default();
+    let core = assemble(
+        dir.path(),
+        Arc::new(CapturingHarness {
+            script: mock_script(),
+            seen: seen.clone(),
+            steerable: false,
+        }),
+    );
+    let client = comet_rpc::memory_client(core.rpc_service());
+
+    let first_ref = DocumentRef {
+        node_id: "019fbc42-9b06-70a3-ad29-563606bc172a".into(),
+        content_id: "019fbc42-9b06-70a3-ad29-564a1bd00e48".into(),
+        title: "你好我有一个帽衫".into(),
+    };
+    let first_prompt = "@[你好我有一个帽衫](aurin://doc/019fbc42-9b06-70a3-ad29-563606bc172a/019fbc42-9b06-70a3-ad29-564a1bd00e48) 先看看这个文档";
+    let mut request = run_request(first_prompt);
+    request.document_refs = vec![first_ref.clone()];
+    let command = serde_json::to_value(SessionCommandPayload::Run {
+        request,
+        message_id: "msg-ref-1".into(),
+    })
+    .unwrap();
+    client
+        .call(
+            comet_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({ "chatId": CHAT, "command": command }),
+        )
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+        },
+        "first assistant entry to complete",
+    )
+    .await;
+
+    // Second turn carries no `@` mention; the first document must still ride
+    // along as resident session context.
+    let second_prompt = "继续改，不用再 @ 了";
+    let command = serde_json::to_value(SessionCommandPayload::Run {
+        request: run_request(second_prompt),
+        message_id: "msg-ref-2".into(),
+    })
+    .unwrap();
+    client
+        .call(
+            comet_rpc::methods::QUEUE_COMMAND,
+            serde_json::json!({ "chatId": CHAT, "command": command }),
+        )
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .filter(|e| {
+                    e.role == MessageRole::Assistant
+                        && e.status == Some(MessageStatus::Complete)
+                })
+                .count()
+                >= 2
+        },
+        "second assistant entry to complete",
+    )
+    .await;
+
+    let requests = seen.lock().unwrap().clone();
+    let second_run = requests
+        .iter()
+        .find(|r| r.prompt == second_prompt)
+        .expect("second run reached the harness");
+    assert_eq!(second_run.document_refs, vec![first_ref]);
 }
 
 /// Real-CLI proof of the image pipeline: upload a tiny solid-red PNG through

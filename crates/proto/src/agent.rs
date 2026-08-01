@@ -1,5 +1,7 @@
 //! Agent-side wire types: harness identity, run requests, streaming events, tool calls.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -123,6 +125,46 @@ pub struct DocumentRef {
     pub node_id: String,
     pub content_id: String,
     pub title: String,
+}
+
+/// Parse Aurin workspace document mentions from
+/// `@[title](aurin://doc/{node_id}/{content_id})` tokens in chat text.
+///
+/// The persisted message text is the source of truth for which documents a
+/// chat has referenced, so the engine can rebuild the same registry after a
+/// restart without extra state. Mentions are deduplicated by `content_id`.
+pub fn document_refs_from_text(text: &str) -> Vec<DocumentRef> {
+    const MARKER: &str = "](aurin://doc/";
+    let mut refs = Vec::new();
+    let mut seen = HashSet::new();
+    for (start, _) in text.match_indices("@[") {
+        let title_start = start + 2;
+        let Some(title_len) = text[title_start..].find(']') else {
+            continue;
+        };
+        let title_end = title_start + title_len;
+        let Some(marker_rel) = text[title_end..].find(MARKER) else {
+            continue;
+        };
+        let id_start = title_end + marker_rel + MARKER.len();
+        let Some(id_len) = text[id_start..].find(')') else {
+            continue;
+        };
+        let id_end = id_start + id_len;
+        let mut ids = text[id_start..id_end].split('/');
+        let (Some(node_id), Some(content_id)) = (ids.next(), ids.next()) else {
+            continue;
+        };
+        if !seen.insert(content_id.to_owned()) {
+            continue;
+        }
+        refs.push(DocumentRef {
+            node_id: node_id.to_owned(),
+            content_id: content_id.to_owned(),
+            title: text[title_start..title_end].to_owned(),
+        });
+    }
+    refs
 }
 
 /// One prior conversation turn passed to a harness for model context.
@@ -343,5 +385,31 @@ mod tests {
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
         );
+    }
+
+    #[test]
+    fn document_refs_parse_mentions() {
+        let refs = document_refs_from_text(
+            "@[需求文档](aurin://doc/n1/c1) 帮我改一下 @[周报](aurin://doc/n2/c2) 也看看",
+        );
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].title, "需求文档");
+        assert_eq!(refs[0].node_id, "n1");
+        assert_eq!(refs[0].content_id, "c1");
+        assert_eq!(refs[1].content_id, "c2");
+    }
+
+    #[test]
+    fn document_refs_dedupe_by_content_id() {
+        let refs = document_refs_from_text(
+            "@[A](aurin://doc/n1/c1) @[A新标题](aurin://doc/n2/c1)",
+        );
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].node_id, "n1");
+    }
+
+    #[test]
+    fn document_refs_ignore_plain_at_mentions() {
+        assert!(document_refs_from_text("hello @world, no aurin refs").is_empty());
     }
 }

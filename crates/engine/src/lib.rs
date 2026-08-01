@@ -12,6 +12,7 @@ use comet_sync::DocsStore;
 
 pub mod doc_host;
 pub mod instance_lock;
+pub mod mentions;
 pub mod registry;
 pub mod rpc;
 pub mod run_journal;
