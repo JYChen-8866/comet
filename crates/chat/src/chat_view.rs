@@ -64,6 +64,19 @@ impl ChatView {
         });
     }
 
+    /// Replace the `@` that opened the mention picker with the picked token.
+    pub fn insert_composer_mention(
+        &mut self,
+        text: &str,
+        trigger_offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.composer.update(cx, |composer, cx| {
+            composer.insert_mention_text(text, trigger_offset, window, cx);
+        });
+    }
+
     pub fn new(config: ChatConfig, cx: &mut Context<Self>) -> Self {
         // Host apps (Aurin) may not have initialized gpui's tokio bridge.
         static TOKIO_INIT: AtomicBool = AtomicBool::new(false);

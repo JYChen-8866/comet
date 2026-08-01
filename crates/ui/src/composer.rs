@@ -1234,6 +1234,35 @@ impl ComposerInput {
     }
 }
 
+impl ComposerInput {
+    /// Byte range covering the `@` that opened the mention picker at
+    /// `trigger_offset`, when the caret still sits right after that `@`.
+    fn mention_trigger_range(content: &str, trigger_offset: usize) -> Option<Range<usize>> {
+        if trigger_offset == 0 || trigger_offset > content.len() {
+            return None;
+        }
+        let start = trigger_offset - 1;
+        (content.get(start..trigger_offset) == Some("@")).then_some(start..trigger_offset)
+    }
+
+    /// Replace the `@` that triggered the mention picker with the picked
+    /// token instead of stacking a second `@` at the caret.
+    pub fn insert_mention_at(
+        &mut self,
+        text: &str,
+        trigger_offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(byte_range) = Self::mention_trigger_range(&self.content, trigger_offset) {
+            let utf16_range = self.range_to_utf16(&byte_range);
+            self.replace_text_in_range(Some(utf16_range), text, window, cx);
+        } else {
+            self.replace_text_in_range(None, text, window, cx);
+        }
+    }
+}
+
 impl EventEmitter<ComposerInputEvent> for ComposerInput {}
 
 impl Focusable for ComposerInput {
@@ -1803,6 +1832,18 @@ impl Composer {
     ) {
         self.input
             .update(cx, |input, cx| input.replace_text_in_range(None, text, window, cx));
+    }
+
+    /// Replace the `@` that opened the mention picker with the picked token.
+    pub fn insert_mention_text(
+        &mut self,
+        text: &str,
+        trigger_offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.input
+            .update(cx, |input, cx| input.insert_mention_at(text, trigger_offset, window, cx));
     }
 
     // ---- attachment staging (use-attachments.ts) ----
@@ -3689,7 +3730,7 @@ mod tests {
 
 #[cfg(test)]
 mod mention_tests {
-    use super::document_refs_from_text;
+    use super::{ComposerInput, document_refs_from_text};
 
     #[test]
     fn parses_single_document_mention() {
@@ -3698,6 +3739,23 @@ mod mention_tests {
         assert_eq!(refs[0].node_id, "n1");
         assert_eq!(refs[0].content_id, "c1");
         assert_eq!(refs[0].title, "需求文档");
+    }
+
+    #[test]
+    fn parses_mention_after_plain_double_at() {
+        // The host used to leave the `@` that opened the picker behind,
+        // producing `@@[...]`. The structured parser must still resolve it.
+        let refs = document_refs_from_text("@@[需求文档](aurin://doc/n1/c1) 帮我改一下");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].node_id, "n1");
+        assert_eq!(refs[0].content_id, "c1");
+    }
+
+    #[test]
+    fn mention_trigger_range_covers_only_trigger_at() {
+        assert_eq!(ComposerInput::mention_trigger_range("hi @", 4), Some(3..4));
+        assert_eq!(ComposerInput::mention_trigger_range("hi @", 3), None);
+        assert_eq!(ComposerInput::mention_trigger_range("", 0), None);
     }
 
     #[test]
