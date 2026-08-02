@@ -28,6 +28,7 @@ pub mod settings;
 pub mod shell;
 pub mod sound;
 pub mod state;
+pub mod tag;
 pub mod theme;
 pub mod transcript;
 

@@ -27,7 +27,7 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use comet_doc::SessionMessageEntry;
+use comet_doc::{MessagePart, SessionMessageEntry};
 use comet_engine::{Engine, EngineConfig, EngineRuntime};
 use comet_proto::{Chat, ChatIndicator, Device, HarnessId, Session, Space};
 use comet_rpc::{RpcClient, RpcService, connect_ws, memory_client, methods};
@@ -334,6 +334,31 @@ impl AppState {
     }
 
     pub fn apply_transcript(&mut self, entries: Vec<SessionMessageEntry>) {
+        eprintln!(
+            "[AppState] apply_transcript: selected_chat={:?}, entries_count={}",
+            self.selected_chat,
+            entries.len()
+        );
+        // Log InputChip status from entries
+        for entry in &entries {
+            for part in &entry.parts {
+                if let MessagePart::Input {
+                    id,
+                    resolved,
+                    questions,
+                    ..
+                } = part
+                {
+                    eprintln!(
+                        "[AppState] apply_transcript: entry_id={}, part_id={}, resolved={}, questions={:?}",
+                        entry.id,
+                        id,
+                        resolved,
+                        questions.iter().map(|q| &q.header).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
         // Doc frames supersede optimistic echoes carrying the same id.
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
@@ -1321,5 +1346,4 @@ mod tests {
         c.branch = None;
         assert_eq!(chat_location(&c), None);
     }
-
 }

@@ -1709,8 +1709,7 @@ async fn document_refs_stay_resident_across_turns() {
             entries_now(&core)
                 .iter()
                 .filter(|e| {
-                    e.role == MessageRole::Assistant
-                        && e.status == Some(MessageStatus::Complete)
+                    e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
                 })
                 .count()
                 >= 2

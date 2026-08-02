@@ -433,6 +433,18 @@ impl DocHost {
                 request,
                 message_id,
             } => {
+                // Never start a second run under a live one: the harness owns
+                // one runtime turn per session, and a racing dispatch wedges
+                // the chat with "agent session has an uncommitted turn".
+                if sessions.is_active(chat_id) {
+                    return Ok((
+                        SessionCommandStatus::Rejected,
+                        Some(
+                            "a run is already in progress for this chat; wait for it or interrupt it"
+                                .into(),
+                        ),
+                    ));
+                }
                 // Claim-on-first-command: a run for a chat with no workspace row
                 // creates the row under our device id (we are about to host it).
                 if let Some(ws) = self.workspace() {
@@ -456,6 +468,15 @@ impl DocHost {
                 match sessions.steer(chat_id, prompt, message_id.clone()).await? {
                     SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
                     SteerOutcome::NotSteerable => {
+                        if sessions.is_active(chat_id) {
+                            return Ok((
+                                SessionCommandStatus::Rejected,
+                                Some(
+                                    "a run is already in progress and this harness cannot steer it"
+                                        .into(),
+                                ),
+                            ));
+                        }
                         // No live steerable run: the durable command still delivers —
                         // run it as the next turn (comet's fallback, executor-side).
                         // After an engine restart `last_request` is empty too, so
@@ -474,7 +495,8 @@ impl DocHost {
                         };
                         request.prompt = prompt.clone();
                         request.resume = None; // dispatch re-derives the harness session
-                        request.context = context_turns(&handle.doc.read_entries().unwrap_or_default());
+                        request.context =
+                            context_turns(&handle.doc.read_entries().unwrap_or_default());
                         // A reused config must not re-inline the PREVIOUS
                         // turn's images; this steer's own refs (if any) already
                         // ride the prompt text.
@@ -502,9 +524,15 @@ impl DocHost {
                 request_id,
                 answers,
             } => {
+                eprintln!(
+                    "[DocHost] RespondInput: chat_id={}, request_id={}",
+                    chat_id, request_id
+                );
                 if sessions.respond_input(chat_id, request_id, answers.clone())? {
+                    eprintln!("[DocHost] RespondInput: handled by live session");
                     return Ok((SessionCommandStatus::Applied, None));
                 }
+                eprintln!("[DocHost] RespondInput: no live session, checking for orphan fallback");
                 // No live resolver. Only a request id the doc shows as an
                 // OPEN question on a SETTLED entry gets the orphan fallback:
                 // a mismatched or already-resolved id is a stale/buggy answer
@@ -534,6 +562,15 @@ impl DocHost {
                         Some("no pending input request".into()),
                     ));
                 };
+                // The request id's resolver is gone, but a run is still live:
+                // the answer already landed (or was consumed by another device)
+                // and a fallback turn would collide with the live harness turn.
+                if sessions.is_active(chat_id) {
+                    return Ok((
+                        SessionCommandStatus::Rejected,
+                        Some("no pending input request for the live run".into()),
+                    ));
+                }
                 // The run died under the question (engine restart, crash).
                 // The question is still open in the doc and the command is
                 // durable, so honor it anyway — stamp the part resolved and

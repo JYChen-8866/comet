@@ -75,7 +75,12 @@ impl Element for Frosted {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let _ = (Theme::GLASS_ALPHA, bounds, self.corner_radius, self.blur_radius);
+        let _ = (
+            Theme::GLASS_ALPHA,
+            bounds,
+            self.corner_radius,
+            self.blur_radius,
+        );
         self.child.paint(window, cx);
     }
 }

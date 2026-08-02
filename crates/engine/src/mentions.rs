@@ -8,7 +8,7 @@
 //! state.
 
 use comet_doc::{MessagePart, MessageRole, SessionMessageEntry};
-use comet_proto::{document_refs_from_text, DocumentRef, RunRequest};
+use comet_proto::{DocumentRef, RunRequest, document_refs_from_text};
 
 /// Fold every `@`-ed document reference found in `entries` into `request`.
 ///
@@ -98,7 +98,11 @@ mod tests {
                 "@[需求文档](aurin://doc/n1/c1) 帮我改一下",
             ),
             text_entry("a1", MessageRole::Assistant, "改好了"),
-            text_entry("u2", MessageRole::User, "@[周报](aurin://doc/n2/c2) 也看一下"),
+            text_entry(
+                "u2",
+                MessageRole::User,
+                "@[周报](aurin://doc/n2/c2) 也看一下",
+            ),
         ];
 
         merge_resident_document_refs(&mut request, &entries);
@@ -134,7 +138,11 @@ mod tests {
                 MessageRole::User,
                 "@[需求文档-旧](aurin://doc/n1/c1) 帮我改一下",
             ),
-            text_entry("u2", MessageRole::User, "@[周报](aurin://doc/n2/c2) 也看一下"),
+            text_entry(
+                "u2",
+                MessageRole::User,
+                "@[周报](aurin://doc/n2/c2) 也看一下",
+            ),
         ];
 
         merge_resident_document_refs(&mut request, &entries);

@@ -401,9 +401,7 @@ mod tests {
 
     #[test]
     fn document_refs_dedupe_by_content_id() {
-        let refs = document_refs_from_text(
-            "@[A](aurin://doc/n1/c1) @[A新标题](aurin://doc/n2/c1)",
-        );
+        let refs = document_refs_from_text("@[A](aurin://doc/n1/c1) @[A新标题](aurin://doc/n2/c1)");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].node_id, "n1");
     }

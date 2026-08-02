@@ -10,8 +10,8 @@
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
 //! dock. Double-clicking a handle resets that pane to its default width.
 
-use std::path::PathBuf;
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -105,8 +105,7 @@ fn binding_matches(left: &KeyBinding, right: &KeyBinding) -> bool {
     left.keystrokes() == right.keystrokes()
         && left.action().name() == right.action().name()
         && left.action_input() == right.action_input()
-        && left.predicate().map(|p| p.to_string())
-            == right.predicate().map(|p| p.to_string())
+        && left.predicate().map(|p| p.to_string()) == right.predicate().map(|p| p.to_string())
 }
 
 /// (Re-)apply the whole app keymap: clears every binding, restores the composer
@@ -127,12 +126,15 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     // the shortcuts comet itself installed last time, so a re-application
     // replaces comet's shortcuts without destroying the host's bindings.
     let snapshot: Vec<KeyBinding> = cx.key_bindings().borrow().bindings().cloned().collect();
-    let previous_comet = COMET_KEY_BINDINGS.with(|installed| {
-        std::mem::take(&mut *installed.borrow_mut())
-    });
+    let previous_comet =
+        COMET_KEY_BINDINGS.with(|installed| std::mem::take(&mut *installed.borrow_mut()));
     let preserved: Vec<KeyBinding> = snapshot
         .into_iter()
-        .filter(|binding| !previous_comet.iter().any(|comet| binding_matches(binding, comet)))
+        .filter(|binding| {
+            !previous_comet
+                .iter()
+                .any(|comet| binding_matches(binding, comet))
+        })
         .collect();
 
     cx.clear_key_bindings();
@@ -497,6 +499,7 @@ impl Shell {
                     transcript.update(cx, |t, cx| t.on_own_send(cx));
                 }
                 ComposerEvent::MentionRequested { .. } => {}
+                ComposerEvent::MentionCleared => {}
             }
         });
         // Working-indicator heartbeat: notify once a second while a session is
@@ -652,9 +655,7 @@ impl Shell {
             }
         }
         // Capture knob: the add-space palette needs only the device registry.
-        if self.debug_dialog.as_deref() == Some("add-space")
-            && !state.read(cx).devices.is_empty()
-        {
+        if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
             self.debug_dialog = None;
             self.open_add_space(cx);
         }
@@ -729,10 +730,12 @@ impl Shell {
         {
             let (selected_space, selected_chat, chat_space) = {
                 let s = state.read(cx);
-                let chat_space = s
-                    .selected_chat_row()
-                    .and_then(|c| c.space_id.clone());
-                (s.selected_space.clone(), s.selected_chat.clone(), chat_space)
+                let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
+                (
+                    s.selected_space.clone(),
+                    s.selected_chat.clone(),
+                    chat_space,
+                )
             };
             if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
                 self.space_last_chat.insert(space, chat);
@@ -842,10 +845,7 @@ impl Shell {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let path = self
-            .data_dir
-            .to_string_lossy()
-            .into_owned();
+        let path = self.data_dir.to_string_lossy().into_owned();
         self.default_space_task = Some(cx.spawn(async move |this, cx| {
             let params = serde_json::json!({
                 "op": "createSpace",
@@ -874,7 +874,12 @@ impl Shell {
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
-        let chat = self.state.read(cx).selected_chat.clone().unwrap_or_default();
+        let chat = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .unwrap_or_default();
         self.nav.push(NavEntry::Chat(chat));
         cx.notify();
     }
@@ -1423,7 +1428,9 @@ impl Shell {
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover))
-            .when(selected, |el| el.shadow(crate::theme::glass_selected_shadows()))
+            .when(selected, |el| {
+                el.shadow(crate::theme::glass_selected_shadows())
+            })
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1639,9 +1646,9 @@ impl Shell {
                                     .text_color(theme.text)
                                     .cursor_pointer()
                                     .hover(|s| s.bg(crate::theme::white_alpha(0.06)))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.start_new_session(cx)
-                                    }))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.start_new_session(cx)),
+                                    )
                                     .child(
                                         icon(icons::PLUS)
                                             .size(px(14.0))
@@ -1649,48 +1656,42 @@ impl Shell {
                                     )
                                     .child(SharedString::from("New session")),
                             )
-                    .child(
-                        div()
-                            .px(px(Theme::SPACE_SM))
-                            .pt(px(12.0))
-                            .pb(px(4.0))
-                            .text_size(px(11.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from("Sessions")),
-                    )
-                    .child(if !list_items.is_empty() {
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .pb(px(Theme::SPACE_SM))
-                            .children(list_items)
-                            .into_any_element()
-                    } else {
-                        div()
-                            .px(px(Theme::SPACE_SM))
-                            .pb(px(Theme::SPACE_SM))
-                            .text_size(px(12.0))
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from("No sessions yet"))
-                            .into_any_element()
-                    }),
+                            .child(
+                                div()
+                                    .px(px(Theme::SPACE_SM))
+                                    .pt(px(12.0))
+                                    .pb(px(4.0))
+                                    .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(theme.text_muted.opacity(0.6))
+                                    .child(SharedString::from("Sessions")),
+                            )
+                            .child(if !list_items.is_empty() {
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.0))
+                                    .pb(px(Theme::SPACE_SM))
+                                    .children(list_items)
+                                    .into_any_element()
+                            } else {
+                                div()
+                                    .px(px(Theme::SPACE_SM))
+                                    .pb(px(Theme::SPACE_SM))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from("No sessions yet"))
+                                    .into_any_element()
+                            }),
                     )
                     .when(lists_fade_top && !glass, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(24.0))
-                                .bg(gpui::linear_gradient(
-                                    180.0,
-                                    gpui::linear_color_stop(sidebar_fade, 0.0),
-                                    gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
-                                )),
-                        )
+                        el.child(div().absolute().top_0().left_0().right_0().h(px(24.0)).bg(
+                            gpui::linear_gradient(
+                                180.0,
+                                gpui::linear_color_stop(sidebar_fade, 0.0),
+                                gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
+                            ),
+                        ))
                     })
                     .when(lists_fade_bottom && !glass, |el| {
                         el.child(
@@ -2140,9 +2141,7 @@ impl Shell {
                             popover::btn_primary(&theme_owned, "Add a space")
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.open_add_space(cx)
-                                })),
+                                .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
                         ),
                 ))
                 .into_any_element()
@@ -2793,14 +2792,7 @@ impl Render for Shell {
                     .flex()
                     .flex_col()
                     .child(title_bar)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .flex_row()
-                            .child(card)
-                    )
+                    .child(div().flex_1().min_h_0().flex().flex_row().child(card))
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(motion::fade_in("phase-app", page))

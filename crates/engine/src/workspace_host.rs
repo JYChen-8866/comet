@@ -598,7 +598,6 @@ impl WorkspaceHostInner {
             }
         }
     }
-
 }
 
 /// Local live statuses win for this device's chats; every other device's rows come

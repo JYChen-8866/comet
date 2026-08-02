@@ -263,11 +263,7 @@ impl Render for ShortcutsPage {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(widgets::page_header(
-                                        &theme,
-                                        "Keyboard shortcuts",
-                                        None,
-                                    ))
+                                    .child(widgets::page_header(&theme, "Keyboard shortcuts", None))
                                     .child(
                                         widgets::page_subtitle(
                                             &theme,
@@ -292,12 +288,14 @@ impl Render for ShortcutsPage {
                                             s.bg(crate::theme::white_alpha(0.04))
                                                 .text_color(Theme::dark().text)
                                         })
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.keymap = KeymapConfig::default();
-                                            this.recording = None;
-                                            this.conflict_notice = None;
-                                            this.commit(cx);
-                                        }))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.keymap = KeymapConfig::default();
+                                                this.recording = None;
+                                                this.conflict_notice = None;
+                                                this.commit(cx);
+                                            }),
+                                        )
                                     })
                                     .child(
                                         crate::icons::icon(crate::icons::RESTART)

@@ -13,13 +13,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
-    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
-    SharedString, Style, StyledImage as _, Subscription, Task, TextRun, TextStyle, UTF16Selection,
-    TransformationMatrix, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
-    prelude::*, px, quad, relative, size,
+    App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle, ElementInputHandler, Entity,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    PaintQuad, PathPromptOptions, Pixels, Point, SharedString, Style, StyledImage as _,
+    Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine,
+    actions, div, fill, img, point, prelude::*, px, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -31,6 +30,7 @@ use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::Pickers;
 use crate::state::{AppState, Indicator};
+use crate::tag::Tag;
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -65,9 +65,6 @@ pub const MIN_COMPACT_INPUT_WIDTH: f32 = 200.0;
 /// Input text metrics: `text-[14px] leading-relaxed` = 14 × 1.625 = 22.75.
 pub const INPUT_LINE_HEIGHT: f32 = 22.75;
 pub const INPUT_TEXT_SIZE: f32 = 14.0;
-/// Horizontal/vertical padding around an inline mention pill.
-pub const MENTION_PILL_PAD_X: f32 = 6.0;
-pub const MENTION_PILL_PAD_Y: f32 = 2.0;
 /// Single-select questions auto-advance after this long.
 pub const AUTO_ADVANCE_MS: u64 = 220;
 
@@ -185,7 +182,7 @@ fn document_refs_from_text(text: &str) -> Vec<DocumentRef> {
 }
 
 /// Builds the visually collapsed composer text: each raw mention token becomes
-/// an `@title` pill, plus the byte-offset maps used to translate caret,
+/// an `@title` text run, plus the byte-offset maps used to translate caret,
 /// selection, and mouse positions back to the raw content.
 fn mention_display_mapping(
     content: &str,
@@ -215,9 +212,9 @@ fn mention_display_mapping(
             continue;
         }
 
-        // The leading space run is the icon slot painted inside the pill; the
-        // raw `@[title](aurin://doc/...)` token still persists in the message.
-        let label = format!("   {}", mention.title);
+        // The pill chrome now lives in the composer's mention-footer row; the
+        // text itself stays blank so the input never shows `@title`.
+        let label = String::new();
         let label_start = display_cursor;
         display.push_str(&label);
         for i in mention.range.start..mention.range.end {
@@ -227,7 +224,12 @@ fn mention_display_mapping(
         for _ in 0..label.len().saturating_sub(1) {
             display_to_content.push(mention.range.start);
         }
-        display_to_content.push(mention.range.end);
+        if !label.is_empty() {
+            display_to_content.push(mention.range.end);
+        }
+        if label_start == 0 && label.is_empty() {
+            display_to_content[0] = mention.range.end;
+        }
         mention_ranges.push(label_start..label_start + label.len());
 
         content_cursor = mention.range.end;
@@ -743,7 +745,13 @@ pub enum ComposerInputEvent {
     Submitted,
     Edited,
     /// The user typed `@`; hosts may open a document mention picker.
-    MentionRequested { offset: usize },
+    MentionRequested {
+        offset: usize,
+    },
+    /// The caret is no longer right after the `@` that opened a mention
+    /// picker (deleted, moved, or followed by more text); hosts should close
+    /// the picker.
+    MentionCleared,
     /// Images pasted from the clipboard (screenshots / copied image data) —
     /// the wrapper stages them as attachments (use-attachments.ts onPaste).
     PastedImages(Vec<gpui::Image>),
@@ -1466,6 +1474,20 @@ impl ComposerInput {
             self.replace_text_in_range(None, text, window, cx);
         }
     }
+
+    /// Remove a raw-content byte range (used by the mention-chip close button;
+    /// the mention tokens are atomic in the input text).
+    pub fn remove_range(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        if range.start > range.end || range.end > self.content.len() {
+            return;
+        }
+        self.content = self.content[..range.start].to_owned() + &self.content[range.end..];
+        self.selected_range = range.start..range.start;
+        self.marked_range = None;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+    }
 }
 
 impl EventEmitter<ComposerInputEvent> for ComposerInput {}
@@ -1531,6 +1553,8 @@ impl EntityInputHandler for ComposerInput {
         self.reset_blink();
         if self.content[..cursor].ends_with('@') {
             cx.emit(ComposerInputEvent::MentionRequested { offset: cursor });
+        } else {
+            cx.emit(ComposerInputEvent::MentionCleared);
         }
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
@@ -1566,6 +1590,8 @@ impl EntityInputHandler for ComposerInput {
             cx.emit(ComposerInputEvent::MentionRequested {
                 offset: range.start + new_text.len(),
             });
+        } else {
+            cx.emit(ComposerInputEvent::MentionCleared);
         }
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
@@ -1596,78 +1622,6 @@ impl EntityInputHandler for ComposerInput {
         let index = self.index_for_mouse_position(point_in_window);
         Some(self.offset_to_utf16(index))
     }
-}
-
-/// Visual-row rectangles for the mention pills that overlap `line`, in the
-/// line's local coordinate space (relative to the composer element origin).
-fn mention_pill_rects(
-    line: &WrappedLine,
-    line_start: usize,
-    mention_ranges: &[Range<usize>],
-    origin: Point<Pixels>,
-    line_height: Pixels,
-) -> Vec<Bounds<Pixels>> {
-    let line_len = line.len();
-    let boundaries: Vec<usize> = line
-        .wrap_boundaries()
-        .iter()
-        .map(|boundary| {
-            let run = &line.runs()[boundary.run_ix];
-            run.glyphs[boundary.glyph_ix].index
-        })
-        .collect();
-    let row_count = boundaries.len() + 1;
-    let mut rects = Vec::new();
-
-    for range in mention_ranges {
-        let raw_start = range.start.saturating_sub(line_start);
-        let raw_end = range.end.saturating_sub(line_start);
-        if raw_end == 0 || raw_start >= line_len {
-            continue;
-        }
-        let local_start = raw_start.min(line_len);
-        let local_end = raw_end.min(line_len);
-        if local_start >= local_end {
-            continue;
-        }
-
-        for row_ix in 0..row_count {
-            let row_start = if row_ix == 0 {
-                0
-            } else {
-                boundaries[row_ix - 1]
-            };
-            let row_end = if row_ix + 1 < row_count {
-                boundaries[row_ix]
-            } else {
-                line_len
-            };
-            let seg_start = local_start.max(row_start);
-            let seg_end = local_end.min(row_end);
-            if seg_start >= seg_end {
-                continue;
-            }
-            let (Some(start_pos), Some(end_pos)) = (
-                line.position_for_index(seg_start, line_height),
-                line.position_for_index(seg_end, line_height),
-            ) else {
-                continue;
-            };
-            let top =
-                origin.y + px(row_ix as f32 * f32::from(line_height)) + px(MENTION_PILL_PAD_Y);
-            let height = line_height - px(2.0 * MENTION_PILL_PAD_Y);
-            let left = origin.x + start_pos.x - px(MENTION_PILL_PAD_X);
-            let right = origin.x + end_pos.x + px(MENTION_PILL_PAD_X);
-            if right <= left {
-                continue;
-            }
-            rects.push(Bounds::from_corners(
-                point(left, top),
-                point(right, top + height),
-            ));
-        }
-    }
-    rects
 }
 
 /// The custom element: measured auto-grow layout + shaped-line painting.
@@ -1826,68 +1780,16 @@ impl gpui::Element for ComposerTextElement {
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
-        let (lines, line_starts, mention_ranges, line_height, scroll) =
-            self.input.update(cx, |input, _| {
-                (
-                    std::mem::take(&mut input.last_lines),
-                    std::mem::take(&mut input.line_starts),
-                    input.mention_ranges.clone(),
-                    input.line_height,
-                    input.scroll_top,
-                )
-            });
+        let (lines, line_starts, line_height, scroll) = self.input.update(cx, |input, _| {
+            (
+                std::mem::take(&mut input.last_lines),
+                std::mem::take(&mut input.line_starts),
+                input.line_height,
+                input.scroll_top,
+            )
+        });
 
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
-            let theme = Theme::of(cx);
-            let pill_bg = theme.accent;
-            let pill_border = theme.accent;
-            let pill_radius = px(0.0);
-            let mut y = bounds.top() - px(scroll);
-            let mut pill_quads = Vec::new();
-            let mut pill_rects = Vec::new();
-            for (line_ix, line) in lines.iter().enumerate() {
-                let height = line.size(line_height).height;
-                let line_start = line_starts.get(line_ix).copied().unwrap_or(0);
-                for rect in mention_pill_rects(
-                    line,
-                    line_start,
-                    &mention_ranges,
-                    point(bounds.left(), y),
-                    line_height,
-                ) {
-                    pill_rects.push(rect);
-                    pill_quads.push(quad(
-                        rect,
-                        pill_radius,
-                        pill_bg,
-                        px(1.0),
-                        pill_border,
-                        BorderStyle::default(),
-                    ));
-                }
-                y += height;
-            }
-            for pill in pill_quads {
-                window.paint_quad(pill);
-            }
-            let icon_size = px(12.0);
-            let icon_color = gpui::white();
-            for rect in pill_rects {
-                let top = rect.top() + (rect.size.height - icon_size) / 2.0;
-                let left = rect.left() + px(2.0);
-                let icon_bounds = Bounds::from_corners(
-                    point(left, top),
-                    point(left + icon_size, top + icon_size),
-                );
-                let _ = window.paint_svg(
-                    icon_bounds,
-                    SharedString::from(crate::icons::FILE),
-                    None,
-                    TransformationMatrix::unit(),
-                    icon_color,
-                    cx,
-                );
-            }
             for quad in prepaint.selection_quads.drain(..) {
                 window.paint_quad(quad);
             }
@@ -1981,6 +1883,8 @@ pub enum ComposerEvent {
     Sent { chat_id: String },
     /// The user typed `@` at `offset`.
     MentionRequested { offset: usize },
+    /// The mention trigger was removed; hosts should close the picker.
+    MentionCleared,
 }
 
 pub struct Composer {
@@ -1993,6 +1897,10 @@ pub struct Composer {
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
+    /// Mentioned documents that persist across sends until the user closes
+    /// the footer tag. Keyed by chat; every Run/Steer carries them alongside
+    /// the current draft's tokens.
+    pinned_mentions: HashMap<String, Vec<DocumentMention>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// In-flight file-picker prompt (paperclip).
@@ -2057,14 +1965,15 @@ impl Composer {
             ComposerInputEvent::Edited => {
                 let text = this.input.read(cx).text().to_string();
                 if text.ends_with('@') {
-                    cx.emit(ComposerEvent::MentionRequested {
-                        offset: text.len(),
-                    });
+                    cx.emit(ComposerEvent::MentionRequested { offset: text.len() });
                 }
                 cx.notify();
             }
             ComposerInputEvent::MentionRequested { offset } => {
                 cx.emit(ComposerEvent::MentionRequested { offset: *offset });
+            }
+            ComposerInputEvent::MentionCleared => {
+                cx.emit(ComposerEvent::MentionCleared);
             }
             ComposerInputEvent::PastedImages(images) => {
                 let staged = images
@@ -2082,6 +1991,7 @@ impl Composer {
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
+            pinned_mentions: HashMap::new(),
             preview: None,
             picker_task: None,
             current_key,
@@ -2161,8 +2071,9 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.input
-            .update(cx, |input, cx| input.replace_text_in_range(None, text, window, cx));
+        self.input.update(cx, |input, cx| {
+            input.replace_text_in_range(None, text, window, cx)
+        });
     }
 
     /// Replace the `@` that opened the mention picker with the picked token.
@@ -2173,8 +2084,99 @@ impl Composer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.input
-            .update(cx, |input, cx| input.insert_mention_at(text, trigger_offset, window, cx));
+        // The picked document becomes a persistent footer tag for this chat:
+        // it survives sends until the tag is closed.
+        if let Some(mention) = document_mentions(text).into_iter().next() {
+            let slot = self
+                .pinned_mentions
+                .entry(self.current_key.clone())
+                .or_default();
+            if !slot
+                .iter()
+                .any(|m| m.content_id == mention.content_id && m.node_id == mention.node_id)
+            {
+                slot.push(mention);
+            }
+        }
+        self.input.update(cx, |input, cx| {
+            input.insert_mention_at(text, trigger_offset, window, cx)
+        });
+        self.input.focus_handle(cx).focus(window, cx);
+    }
+
+    /// Closable document-reference tags under the pill, in the same footer
+    /// area as the git branch toolbar. Pinned mentions persist across sends;
+    /// draft-only tokens (typed while the draft is live) join the row until
+    /// the send clears them.
+    fn render_mention_footer(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let mut mentions = self
+            .pinned_mentions
+            .get(&self.current_key)
+            .cloned()
+            .unwrap_or_default();
+        for mention in document_mentions(self.input.read(cx).text()) {
+            if !mentions
+                .iter()
+                .any(|m| m.content_id == mention.content_id && m.node_id == mention.node_id)
+            {
+                mentions.push(mention);
+            }
+        }
+        if mentions.is_empty() {
+            return None;
+        }
+        let composer = cx.entity();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(10.0));
+        for (index, mention) in mentions.into_iter().enumerate() {
+            let node_id = mention.node_id.clone();
+            let content_id = mention.content_id.clone();
+            let title = mention.title.clone();
+            let composer = composer.clone();
+            let mut tag = Tag::new(title)
+                .small()
+                .icon(crate::icons::FILE)
+                .closable(true)
+                .dark();
+            tag = match index % 4 {
+                0 => tag,
+                1 => tag.success(),
+                2 => tag.warning(),
+                _ => tag.danger(),
+            };
+            row = row.child(tag.on_close(move |_, cx| {
+                composer.update(cx, |this, cx| {
+                    this.remove_pinned_mention(&node_id, &content_id, cx);
+                });
+            }));
+        }
+        Some(row.into_any_element())
+    }
+
+    /// Remove a document from the chat's pinned set, and strip its raw token
+    /// from the draft when it is still present.
+    fn remove_pinned_mention(&mut self, node_id: &str, content_id: &str, cx: &mut Context<Self>) {
+        if let Some(list) = self.pinned_mentions.get_mut(&self.current_key) {
+            list.retain(|m| m.node_id != node_id || m.content_id != content_id);
+            if list.is_empty() {
+                self.pinned_mentions.remove(&self.current_key);
+            }
+        }
+        let content = self.input.read(cx).text().to_string();
+        if let Some(range) = document_mentions(&content)
+            .into_iter()
+            .find(|m| m.node_id == node_id && m.content_id == content_id)
+            .map(|m| m.range)
+        {
+            self.input
+                .update(cx, |input, cx| input.remove_range(range, cx));
+        }
+        cx.notify();
     }
 
     // ---- attachment staging (use-attachments.ts) ----
@@ -2452,6 +2454,14 @@ impl Composer {
             Some(id) => (id, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
+        // A new chat's pinned mentions are stashed under the empty "new-chat"
+        // canvas key. Move them to the real chat id now so the footer tags
+        // survive the send after `select_chat` switches `current_key`.
+        if is_new {
+            if let Some(mentions) = self.pinned_mentions.remove(&self.current_key) {
+                self.pinned_mentions.insert(chat_id.clone(), mentions);
+            }
+        }
         // Where the new session runs (Current checkout / reuse an existing
         // worktree / fresh worktree off the picked base) — resolved NOW so
         // the async block needs no picker access.
@@ -2546,6 +2556,23 @@ impl Composer {
             cx.notify();
         });
 
+        // Pinned mention tags ride every send: the persisted prompt keeps its
+        // own tokens, and this structured side channel carries the documents
+        // the user has pinned in the footer (which survive the draft clear).
+        let pinned_refs: Vec<DocumentRef> = self
+            .pinned_mentions
+            .get(&chat_id)
+            .map(|mentions| {
+                mentions
+                    .iter()
+                    .map(|m| DocumentRef {
+                        node_id: m.node_id.clone(),
+                        content_id: m.content_id.clone(),
+                        title: m.title.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
         self.failure = None;
@@ -2731,7 +2758,15 @@ impl Composer {
                             auto_approve: false,
                             resume: None,
                             attachments: attachment_paths,
-                            document_refs: document_refs_from_text(&content),
+                            document_refs: {
+                                let mut refs = pinned_refs.clone();
+                                for r in document_refs_from_text(&content) {
+                                    if !refs.contains(&r) {
+                                        refs.push(r);
+                                    }
+                                }
+                                refs
+                            },
                         },
                         message_id: message_id.clone(),
                     }
@@ -2859,8 +2894,13 @@ impl Composer {
     /// Submit RespondInput and retire the panel.
     fn wizard_finish(&mut self, answers: Vec<UserInputAnswer>, cx: &mut Context<Self>) {
         let Some(wizard) = self.wizard.take() else {
+            eprintln!("[Composer] wizard_finish: no wizard present");
             return;
         };
+        eprintln!(
+            "[Composer] wizard_finish: request_id={}, answers={:?}",
+            wizard.request_id, answers
+        );
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
         self.input.update(cx, |input, cx| {
@@ -2869,11 +2909,14 @@ impl Composer {
             input.set_placeholder("Do anything…", cx);
         });
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            eprintln!("[Composer] wizard_finish: no engine available");
             return;
         };
         let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            eprintln!("[Composer] wizard_finish: no chat selected");
             return;
         };
+        eprintln!("[Composer] wizard_finish: chat_id={}", chat_id);
         let request_id = wizard.request_id.clone();
         let command = SessionCommandPayload::RespondInput {
             request_id: request_id.clone(),
@@ -2881,10 +2924,18 @@ impl Composer {
         };
         let params = match serde_json::to_value(&command) {
             Ok(value) => serde_json::json!({ "chatId": chat_id, "command": value }),
-            Err(_) => return,
+            Err(_) => {
+                eprintln!("[Composer] wizard_finish: failed to serialize command");
+                return;
+            }
         };
+        eprintln!("[Composer] wizard_finish: sending QUEUE_COMMAND");
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            eprintln!(
+                "[Composer] wizard_finish: QUEUE_COMMAND result={:?}",
+                result
+            );
             if let Err(err) = result {
                 this.update(cx, |composer, cx| {
                     composer.failure = Some(format!("Answer failed: {err}").into());
@@ -3087,7 +3138,15 @@ impl Composer {
                     )
                     .child(
                         div()
+                            .id("wizard-question")
                             .mt(px(6.0))
+                            // Long confirmation payloads (e.g. tool-call
+                            // arguments) must not push the option rows or the
+                            // action buttons off-screen: cap the question area
+                            // and scroll within it.
+                            .max_h(px(160.0))
+                            .overflow_y_scroll()
+                            .pr(px(8.0))
                             .text_size(px(15.0))
                             .line_height(px(20.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
@@ -3416,6 +3475,9 @@ impl Render for Composer {
         }
         self.last_rendered_height = pill_height;
 
+        // Document references mentioned in the draft render as closable tags
+        // under the pill (next to the git branch toolbar), not as painted
+        // pills in the text itself.
         let send_button = self.render_send_button(mode, cx);
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
@@ -3457,8 +3519,7 @@ impl Render for Composer {
             .rounded(px(26.0))
             .bg(pill_bg)
             .border_1()
-            .border_color(theme.border)
-            .shadow_lg();
+            .border_color(theme.border);
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
@@ -3575,6 +3636,12 @@ impl Render for Composer {
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
         let container = container.child(motion::fade_quick("composer-input", body));
+        // Mentioned-document tags live under the pill, in the same footer area
+        // as the git branch toolbar.
+        let container = match self.render_mention_footer(cx) {
+            Some(footer) => container.child(footer),
+            None => container,
+        };
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
@@ -4094,9 +4161,7 @@ mod mention_tests {
 
     #[test]
     fn deduplicates_same_content_id() {
-        let refs = document_refs_from_text(
-            "@[A](aurin://doc/n1/c1) and @[B](aurin://doc/n2/c1)",
-        );
+        let refs = document_refs_from_text("@[A](aurin://doc/n1/c1) and @[B](aurin://doc/n2/c1)");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].node_id, "n1");
     }
@@ -4116,7 +4181,9 @@ mod mention_tests {
 
         let (display, content_to_display, display_to_content, mention_ranges) =
             mention_display_mapping(text, &mentions);
-        let label = format!("   {}", mentions[0].title);
+        // The mention token is hidden in the input: only the footer tag shows
+        // the document.
+        let label = String::new();
         assert_eq!(display, format!("{label} hi"));
         assert_eq!(mention_ranges, vec![0..label.len()]);
         assert_eq!(display_to_content[label.len()], text.find(" hi").unwrap());

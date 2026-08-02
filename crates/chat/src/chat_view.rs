@@ -1,14 +1,15 @@
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{path::PathBuf, rc::Rc};
 
+use comet_rpc::RpcClient;
+use comet_ui::HarnessId;
 use comet_ui::composer::{Composer, ComposerEvent};
 use comet_ui::state::{AppState, ConnectionStatus, EngineBootConfig};
 use comet_ui::theme::Theme;
 use comet_ui::transcript::Transcript;
-use comet_ui::HarnessId;
-use comet_rpc::RpcClient;
 use gpui::{
-    Context, Entity, EventEmitter, Render, Subscription, Window, div, prelude::*, px,
+    Anchor, AnyElement, App, Context, Entity, EventEmitter, Render, Subscription, Window, div,
+    prelude::*, px,
 };
 
 /// Everything a host app needs to embed the chat interface.
@@ -29,6 +30,7 @@ pub struct ChatView {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    mention_popup: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
     initial_select_done: bool,
     initial_chat_id: Option<String>,
     _state_observation: Subscription,
@@ -40,6 +42,8 @@ pub struct ChatView {
 pub enum ChatEvent {
     /// The user typed `@` in the composer; hosts may open a document picker.
     MentionRequested { offset: usize },
+    /// The `@` that opened a mention picker was removed; hosts should close it.
+    MentionCleared,
 }
 
 impl EventEmitter<ChatEvent> for ChatView {}
@@ -77,6 +81,18 @@ impl ChatView {
         });
     }
 
+    /// Host-rendered popup (e.g. Aurin's `@` document picker) anchored above
+    /// the composer, so it floats above the input instead of covering it. The
+    /// builder is invoked on every render so listener bindings stay fresh.
+    pub fn set_mention_popup(
+        &mut self,
+        popup: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.mention_popup = popup;
+        cx.notify();
+    }
+
     pub fn new(config: ChatConfig, cx: &mut Context<Self>) -> Self {
         // Host apps (Aurin) may not have initialized gpui's tokio bridge.
         static TOKIO_INIT: AtomicBool = AtomicBool::new(false);
@@ -112,10 +128,8 @@ impl ChatView {
         comet_ui::composer::init(cx);
 
         let state = cx.new(|_| AppState::new());
-        let handle = comet_ui::state::EngineHandle::from_client(
-            client,
-            "comet-chat-memory".to_string(),
-        );
+        let handle =
+            comet_ui::state::EngineHandle::from_client(client, "comet-chat-memory".to_string());
         state.update(cx, |state, cx| {
             state.data_dir = Some(config.data_dir.clone());
             state.attach_engine(handle, cx);
@@ -136,23 +150,20 @@ impl ChatView {
         Self::finish(state, config, cx)
     }
 
-    fn finish(
-        state: Entity<AppState>,
-        config: ChatConfig,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    fn finish(state: Entity<AppState>, config: ChatConfig, cx: &mut Context<Self>) -> Self {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
-            move |_this: &mut Self, _, event: &ComposerEvent, cx| {
-                match event {
-                    ComposerEvent::Sent { .. } => {
-                        transcript.update(cx, |t, cx| t.on_own_send(cx));
-                    }
-                    ComposerEvent::MentionRequested { offset } => {
-                        cx.emit(ChatEvent::MentionRequested { offset: *offset });
-                    }
+            move |_this: &mut Self, _, event: &ComposerEvent, cx| match event {
+                ComposerEvent::Sent { .. } => {
+                    transcript.update(cx, |t, cx| t.on_own_send(cx));
+                }
+                ComposerEvent::MentionRequested { offset } => {
+                    cx.emit(ChatEvent::MentionRequested { offset: *offset });
+                }
+                ComposerEvent::MentionCleared => {
+                    cx.emit(ChatEvent::MentionCleared);
                 }
             }
         });
@@ -165,6 +176,7 @@ impl ChatView {
             state,
             transcript,
             composer,
+            mention_popup: None,
             initial_select_done: false,
             initial_chat_id,
             _state_observation: state_observation,
@@ -190,13 +202,14 @@ impl ChatView {
         if let Some(chat_id) = target {
             self.initial_select_done = true;
             let _ = state;
-            self.state.update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+            self.state
+                .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         }
     }
 }
 
 impl Render for ChatView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let conversation = div()
             .w_full()
@@ -206,7 +219,24 @@ impl Render for ChatView {
         let composer = div()
             .w_full()
             .max_w(px(760.0))
+            .relative()
             .child(self.composer.clone());
+        let composer = match &self.mention_popup {
+            Some(builder) => composer.child(
+                div()
+                    .absolute()
+                    .left(px(16.0))
+                    .top_0()
+                    .size_0()
+                    .child(gpui::deferred(
+                        gpui::anchored()
+                            .anchor(Anchor::BottomLeft)
+                            .snap_to_window_with_margin(px(8.0))
+                            .child(div().occlude().pb(px(6.0)).child(builder(window, cx))),
+                    )),
+            ),
+            None => composer,
+        };
         div()
             .id("comet-chat")
             .size_full()

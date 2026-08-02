@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-pub mod composer;
 pub mod archived;
+pub mod composer;
 pub mod shortcuts;
 pub mod widgets;
 
@@ -409,5 +409,4 @@ mod tests {
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
     }
-
 }

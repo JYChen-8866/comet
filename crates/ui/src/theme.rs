@@ -47,6 +47,8 @@ pub struct Theme {
     pub danger: Hsla,
     /// Warning — amber (offline notices, awaiting-input).
     pub warning: Hsla,
+    /// Success — green (completed states, positive tags).
+    pub success: Hsla,
 
     // ---- fonts ----
     /// UI font family (bundling of Geist lands with asset work; until then the
@@ -110,7 +112,7 @@ impl Theme {
     /// `#060606`, shell/sidebar `#0d0d0d`.
     pub fn dark() -> Self {
         Self {
-            bg: grey(6),      // main panel — sampled #060606
+            bg: grey(6),       // main panel — sampled #060606
             surface: grey(13), // shell / sidebar — sampled #0d0d0d
             surface_raised: neutral(0.235),
             element_hover: wash(0.14),
@@ -124,6 +126,7 @@ impl Theme {
             accent_strong: oklch(0.585, 0.233, 277.117), // indigo-500
             danger: oklch(0.704, 0.191, 22.216),         // red-400
             warning: oklch(0.828, 0.189, 84.429),        // amber-400
+            success: oklch(0.768, 0.188, 149.5),         // green-400
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),

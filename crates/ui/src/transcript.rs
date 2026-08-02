@@ -200,6 +200,9 @@ pub enum RowKind {
     User {
         /// Visible prompt (attachment-ref trailer already stripped).
         text: SharedString,
+        /// Markdown blocks of the visible prompt (document mentions render
+        /// as capsules through the same renderer as assistant replies).
+        tree: Arc<BlockTree>,
         /// Image refs parsed out of the message text (message-attachments.ts):
         /// thumbnails load from the owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
@@ -319,12 +322,14 @@ pub fn rows_for_entry(
         // Attachment refs ride the plain text (the `withAttachments`
         // transport); split them back out for the thumbnail strip.
         let parsed = crate::attachments::parse_user_message_images(&raw);
+        let tree = parse(entry_id.as_ref(), &parsed.text);
         return vec![Row {
             id: entry.id.clone().into(),
             version: (raw.len() as u64) << 1 | pending as u64,
             turn_start: true,
             kind: RowKind::User {
                 text: parsed.text.into(),
+                tree,
                 attachments: Arc::new(parsed.attachments),
                 pending,
             },
@@ -1187,8 +1192,19 @@ impl Transcript {
             )
         };
 
+        eprintln!(
+            "[Transcript] sync: selected_chat={:?}, entries_count={}, echoes_count={}",
+            selected,
+            entries.len(),
+            echoes.len()
+        );
+
         let attached = selected != self.chat_id;
         if attached {
+            eprintln!(
+                "[Transcript] sync: switching chat from {:?} to {:?}",
+                self.chat_id, selected
+            );
             self.chat_id = selected;
             self.rows.clear();
             self.row_cache.clear();
@@ -1213,6 +1229,16 @@ impl Transcript {
         }
         for echo in &echoes {
             new_rows.extend(self.rows_for(echo, true));
+        }
+
+        // Log InputChip resolved status
+        for row in &new_rows {
+            if let RowKind::InputChip { header, resolved } = &row.kind {
+                eprintln!(
+                    "[Transcript] sync: InputChip row_id={}, header={}, resolved={}",
+                    row.id, header, resolved
+                );
+            }
         }
 
         // Text already streamed before this (re)attach is the veil BASELINE:
@@ -1539,11 +1565,13 @@ impl Transcript {
         let inner: AnyElement = match &row.kind {
             RowKind::User {
                 text,
+                tree,
                 attachments,
                 pending,
             } => {
                 let attachments = attachments.clone();
                 let text = text.clone();
+                let tree = tree.clone();
                 let pending = *pending;
                 // Attachment thumbnails ride ABOVE the bubble, right-aligned
                 // (chat-view.tsx RowView: UserAttachmentStrip then the text
@@ -1553,6 +1581,20 @@ impl Transcript {
                     column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
                 }
                 if !text.is_empty() {
+                    let opts = RenderOptions {
+                        row_key: row.id.clone(),
+                        veil: None,
+                        cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
+                        now: Instant::now(),
+                        copy: None,
+                    };
+                    let body = div().flex().flex_col().gap(px(8.0)).children(
+                        tree.blocks.iter().enumerate().map(|(block_ix, top)| {
+                            render::render_block(
+                                &top.block, block_ix, block_ix, &opts, &theme, window, None,
+                            )
+                        }),
+                    );
                     // `min_w_0` is load-bearing: gpui text answers min/max-content
                     // probes with its UNWRAPPED width, so without it the bubble's
                     // automatic min-size is the full single-line width — the flex
@@ -1572,7 +1614,7 @@ impl Transcript {
                                 .line_height(px(22.0))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
-                                .child(text),
+                                .child(body),
                         ),
                     );
                 }

@@ -87,7 +87,14 @@ impl Element for EdgeFaded {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let _ = (self.band, self.top, self.bottom, self.left, self.right, bounds);
+        let _ = (
+            self.band,
+            self.top,
+            self.bottom,
+            self.left,
+            self.right,
+            bounds,
+        );
         self.child.paint(window, cx);
     }
 }

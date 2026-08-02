@@ -235,7 +235,6 @@ impl Uploads {
             resolved,
         })
     }
-
 }
 
 struct InspectedFile {

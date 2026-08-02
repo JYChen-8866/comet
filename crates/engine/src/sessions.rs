@@ -176,6 +176,19 @@ impl SessionsEngine {
         })
     }
 
+    /// Whether this chat has a run actively working or blocked on input.
+    /// Dispatch guards use this to refuse starting a second run for a chat
+    /// that is still busy — a duplicate run would collide with the live run's
+    /// harness state and wedge the session.
+    pub fn is_active(&self, chat_id: &str) -> bool {
+        lock(&self.inner.statuses).get(chat_id).is_some_and(|s| {
+            matches!(
+                s.status,
+                comet_proto::SessionStatus::Working | comet_proto::SessionStatus::AwaitingInput
+            )
+        })
+    }
+
     /// The last request dispatched for a chat (steer→new-turn fallback).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
@@ -440,19 +453,33 @@ impl SessionsEngine {
         request_id: &str,
         answers: Vec<UserInputAnswer>,
     ) -> Result<bool, EngineError> {
+        eprintln!(
+            "[Sessions] respond_input: chat_id={}, request_id={}, answers={:?}",
+            chat_id, request_id, answers
+        );
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .map(|h| (h.pending_inputs.clone(), h.engine_tx.clone()));
         let Some((pending, engine_tx)) = target else {
+            eprintln!(
+                "[Sessions] respond_input: no active run for chat_id={}",
+                chat_id
+            );
             return Ok(false);
         };
         let Some(resolver) = lock(&pending).remove(request_id) else {
+            eprintln!(
+                "[Sessions] respond_input: no pending input for request_id={}",
+                request_id
+            );
             return Ok(false);
         };
+        eprintln!("[Sessions] respond_input: sending answer to resolver");
         let _ = resolver.send(answers);
         let _ = engine_tx.send(AgentEvent::InputResolved {
             request_id: request_id.to_string(),
         });
+        eprintln!("[Sessions] respond_input: success");
         Ok(true)
     }
 
@@ -555,7 +582,7 @@ impl SessionsEngine {
                             sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
                             attachments: Vec::new(),
-        document_refs: Vec::new(),
+                            document_refs: Vec::new(),
                             resume: None,
                             context: Vec::new(),
                         })

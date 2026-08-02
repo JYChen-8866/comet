@@ -474,6 +474,7 @@ pub struct FlatText {
     pub runs: Vec<TextRun>,
     pub links: Vec<(Range<usize>, String)>,
     pub code_ranges: Vec<Range<usize>>,
+    pub mention_ranges: Vec<Range<usize>>,
 }
 
 /// Inline-code tint (round 9): the original is neutral (chat-view.tsx mdTheme
@@ -490,6 +491,10 @@ pub fn inline_code_wash() -> Hsla {
 pub const INLINE_CODE_RADIUS: f32 = 4.5;
 pub const INLINE_CODE_PAD_X: f32 = 2.0;
 pub const INLINE_CODE_INSET_Y: f32 = 2.0;
+/// Rounded capsule wash behind sent document mentions (`aurin://doc/` links).
+pub const MENTION_RADIUS: f32 = 9.0;
+pub const MENTION_PAD_X: f32 = 6.0;
+pub const MENTION_INSET_Y: f32 = 1.0;
 
 /// Flatten inline runs into shaped-text inputs. Pure given a theme.
 pub fn flatten_runs(runs: &[InlineRun], theme: &Theme, bold_default: bool) -> FlatText {
@@ -511,6 +516,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
     let mut out: Vec<TextRun> = Vec::with_capacity(runs.len());
     let mut links: Vec<(Range<usize>, String)> = Vec::new();
     let mut code_ranges: Vec<Range<usize>> = Vec::new();
+    let mut mention_ranges: Vec<Range<usize>> = Vec::new();
     for run in runs {
         if run.text.is_empty() {
             continue;
@@ -536,13 +542,31 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         // theme underlines in the text color; indigo is reserved for primary
         // actions).
         let is_link = run.style.link.is_some();
+        let is_aurin_link = run
+            .style
+            .link
+            .as_deref()
+            .is_some_and(|url| url.starts_with("aurin://doc/"));
         // Inline code reads violet (see `inline_code_text`); everything else
         // stays the monochrome foreground.
         let color = if run.style.code {
             inline_code_text()
+        } else if is_aurin_link {
+            theme.accent
         } else {
             theme.text
         };
+        if is_aurin_link {
+            let mention_start = if start > 0 && text.as_bytes()[start - 1] == b'@' {
+                start - 1
+            } else {
+                start
+            };
+            match mention_ranges.last_mut() {
+                Some(range) if range.end == mention_start => range.end = text.len(),
+                _ => mention_ranges.push(mention_start..text.len()),
+            }
+        }
         if run.style.code {
             // Merge adjacent code runs into one wash box (like links below).
             match code_ranges.last_mut() {
@@ -572,7 +596,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             // underlay (`code_wash_underlay`) — a run background here could
             // only be a square box.
             background_color: None,
-            underline: is_link.then_some(UnderlineStyle {
+            underline: (!is_aurin_link && is_link).then_some(UnderlineStyle {
                 color: Some(theme.text_muted),
                 thickness: px(1.0),
                 wavy: false,
@@ -588,6 +612,7 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
         runs: out,
         links,
         code_ranges,
+        mention_ranges,
     }
 }
 
@@ -647,10 +672,11 @@ fn flat_text_element(flat: &FlatText, ix: usize, opts: &RenderOptions) -> AnyEle
     // that drive text selection (round 18; see markdown/selection.rs).
     let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
     let code_ranges = flat.code_ranges.clone();
+    let mention_ranges = flat.mention_ranges.clone();
     let flat_text = flat.text.clone();
     let underlay = canvas(
         |_, _, _| (),
-        move |_, _, window, _| {
+        move |_, _, window, cx| {
             let wash = inline_code_wash();
             for range in &code_ranges {
                 for rect in range_rects(&layout, range, INLINE_CODE_PAD_X, INLINE_CODE_INSET_Y) {
@@ -658,6 +684,19 @@ fn flat_text_element(flat: &FlatText, ix: usize, opts: &RenderOptions) -> AnyEle
                         rect,
                         px(INLINE_CODE_RADIUS),
                         wash,
+                        px(0.0),
+                        gpui::transparent_black(),
+                        BorderStyle::default(),
+                    ));
+                }
+            }
+            let capsule = crate::theme::Theme::of(cx).accent.opacity(0.16);
+            for range in &mention_ranges {
+                for rect in range_rects(&layout, range, MENTION_PAD_X, MENTION_INSET_Y) {
+                    window.paint_quad(quad(
+                        rect,
+                        px(MENTION_RADIUS),
+                        capsule,
                         px(0.0),
                         gpui::transparent_black(),
                         BorderStyle::default(),
@@ -1257,6 +1296,57 @@ mod tests {
         assert_eq!(flat.runs[1].color, theme.text);
         assert!(flat.runs[1].underline.is_some());
         assert_eq!(flat.runs[2].font.weight, FontWeight::SEMIBOLD);
+    }
+
+    #[test]
+    fn flatten_runs_marks_aurin_document_mentions() {
+        let theme = Theme::dark();
+        let runs = vec![
+            InlineRun {
+                text: "@".into(),
+                style: InlineStyle::default(),
+            },
+            InlineRun {
+                text: "标题".into(),
+                style: InlineStyle {
+                    link: Some("aurin://doc/n1/c1".into()),
+                    ..Default::default()
+                },
+            },
+            InlineRun {
+                text: " 帮我看看".into(),
+                style: InlineStyle::default(),
+            },
+        ];
+        let flat = flatten_runs(&runs, &theme, false);
+        assert_eq!(flat.text, "@标题 帮我看看");
+        assert_eq!(flat.mention_ranges, vec![0..7]);
+        assert_eq!(flat.runs[1].color, theme.accent);
+        assert!(flat.runs[1].underline.is_none());
+
+        // Ordinary links keep link styling and are not capsules.
+        let link = InlineRun {
+            text: "x".into(),
+            style: InlineStyle {
+                link: Some("https://x.dev".into()),
+                ..Default::default()
+            },
+        };
+        let flat = flatten_runs(&[link], &theme, false);
+        assert!(flat.mention_ranges.is_empty());
+        assert!(flat.runs[0].underline.is_some());
+    }
+
+    #[test]
+    fn parsed_aurin_mentions_flatten_to_capsules() {
+        let theme = Theme::dark();
+        let tree = crate::markdown::parser::parse_full("@[标题](aurin://doc/n1/c1) 帮我看看");
+        let crate::markdown::parser::Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected paragraph");
+        };
+        let flat = flatten_runs(runs, &theme, false);
+        assert_eq!(flat.text, "@标题 帮我看看");
+        assert_eq!(flat.mention_ranges, vec![0..7]);
     }
 
     #[test]
