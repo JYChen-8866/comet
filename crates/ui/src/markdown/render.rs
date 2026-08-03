@@ -116,8 +116,30 @@ impl RenderOptions {
 /// reused as-is. `SharedString`/`Rc` make the reuse O(1) per block.
 #[derive(Default)]
 pub struct RenderCache {
+    theme_key: Option<RenderThemeKey>,
     flats: HashMap<(SharedString, usize, usize), Rc<FlatText>>,
     code: HashMap<(SharedString, usize, usize), Rc<CachedCode>>,
+}
+
+#[derive(Clone, PartialEq)]
+struct RenderThemeKey {
+    text: Hsla,
+    text_muted: Hsla,
+    accent: Hsla,
+    font_sans: SharedString,
+    font_mono: SharedString,
+}
+
+impl RenderThemeKey {
+    fn new(theme: &Theme) -> Self {
+        Self {
+            text: theme.text,
+            text_muted: theme.text_muted,
+            accent: theme.accent,
+            font_sans: theme.font_sans.clone(),
+            font_mono: theme.font_mono.clone(),
+        }
+    }
 }
 
 /// Cached per-line code runs (validity: code length + highlight identity).
@@ -129,6 +151,16 @@ pub struct CachedCode {
 }
 
 impl RenderCache {
+    /// Drop shaped text runs when a live theme change affects their paint or fonts.
+    pub fn sync_theme(&mut self, theme: &Theme) {
+        let next = RenderThemeKey::new(theme);
+        if self.theme_key.as_ref() == Some(&next) {
+            return;
+        }
+        self.clear();
+        self.theme_key = Some(next);
+    }
+
     /// Drop every cached entry for `row`.
     pub fn invalidate_row(&mut self, row: &str) {
         self.flats.retain(|(r, _, _), _| r.as_ref() != row);
@@ -1215,6 +1247,33 @@ mod tests {
         let runs = runs_for_code_line("plain text", &[], &mono, &theme);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len, 10);
+    }
+
+    #[test]
+    fn render_cache_invalidates_colored_runs_when_theme_changes() {
+        let theme = Theme::dark();
+        let mut cache = RenderCache::default();
+        cache.sync_theme(&theme);
+        let runs = [InlineRun {
+            text: "cached model output".into(),
+            style: InlineStyle::default(),
+        }];
+        cache.flats.insert(
+            ("row".into(), 0, 0),
+            std::rc::Rc::new(flatten_runs(&runs, &theme, false)),
+        );
+
+        cache.sync_theme(&theme);
+        assert_eq!(cache.flats.len(), 1);
+        assert_eq!(
+            cache.flats.values().next().unwrap().runs[0].color,
+            theme.text
+        );
+
+        let mut next_theme = theme.clone();
+        next_theme.text = gpui::hsla(0.0, 0.0, 0.1, 1.0);
+        cache.sync_theme(&next_theme);
+        assert!(cache.flats.is_empty());
     }
 
     #[test]

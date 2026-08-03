@@ -1555,6 +1555,7 @@ impl Transcript {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
+        self.render_cache.borrow_mut().sync_theme(&theme);
         let top_gap = if ix == 0 {
             GAP_TURN + 10.0
         } else {

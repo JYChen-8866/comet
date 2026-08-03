@@ -137,29 +137,20 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 // Elements
 // ---------------------------------------------------------------------------
 
-/// The floating-menu surface (comet `.glass-surface` + `menuSurface`):
-/// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint.
-/// gpui has no backdrop blur at the pinned rev, so the glass
-/// (`oklch(0.33 0 0 / 34%)` over blurred dark content) is approximated with
-/// the near-opaque tone it composites to on the dark panels (~#161616), plus
-/// the same hairline + baked-in shadow.
+/// The floating-menu surface (comet `.glass-surface` + `menuSurface`). Hosts
+/// can provide light or dark palettes, so the card uses raised-surface tokens
+/// rather than Comet's original hard-coded dark glass colors.
 pub fn popover_card(theme: &Theme) -> gpui::Div {
-    let card = div()
+    div()
         .border_1()
-        .border_color(white_alpha(0.10))
+        .border_color(theme.border_strong)
         .rounded(px(12.0))
         .shadow_lg()
         .p(px(4.0))
         .overflow_hidden()
         .text_size(px(13.0))
-        .text_color(theme.text);
-    if Theme::GLASS_ALPHA < 1.0 {
-        // Translucent tint — the backdrop blur beneath it comes from the
-        // [`crate::frost::frosted`] wrapper at the mount helpers below.
-        card.bg(grey(0x16).opacity(0.65))
-    } else {
-        card.bg(grey(0x16))
-    }
+        .text_color(theme.text)
+        .bg(theme.surface_raised)
 }
 
 /// [`popover_card`] without the `p-1` inset — for popovers that manage their
@@ -318,19 +309,19 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         .text_size(px(13.0))
         .cursor_pointer();
     if active {
-        row.bg(crate::theme::wash(0.14)).text_color(theme.text)
+        row.bg(theme.element_active).text_color(theme.text)
     } else {
         let fade_key = fade_key.into();
         let mut row = row
             .text_color(motion::hover_blend(
                 &fade_key,
                 theme.text.opacity(0.9),
-                Theme::dark().text,
+                theme.text,
             ))
             .bg(motion::hover_blend(
                 &fade_key,
-                crate::theme::wash(0.0),
-                crate::theme::wash(0.14),
+                theme.element_hover.opacity(0.0),
+                theme.element_hover,
             ));
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
@@ -340,10 +331,9 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
     }
 }
 
-/// [`menu_row`] with a distinct keyboard-navigation highlight: a selected row
-/// carries the full `bg-white/10` wash, the keyboard cursor the lighter
-/// `bg-white/[0.08]` (comet's `data-[highlighted]` styling) — two selected-
-/// looking rows never appear at once.
+/// [`menu_row`] with a distinct keyboard-navigation highlight: selected rows
+/// use the active token while the keyboard cursor uses the hover token, so two
+/// selected-looking rows never appear at once in either color scheme.
 pub fn menu_row_nav(
     theme: &Theme,
     selected: bool,
@@ -352,7 +342,7 @@ pub fn menu_row_nav(
 ) -> gpui::Div {
     let row = menu_row(theme, selected, fade_key);
     if !selected && highlighted {
-        row.bg(crate::theme::wash(0.14)).text_color(theme.text)
+        row.bg(theme.element_hover).text_color(theme.text)
     } else {
         row
     }
@@ -408,11 +398,9 @@ pub fn menu_check(theme: &Theme) -> impl IntoElement {
         .text_color(theme.text.opacity(0.7))
 }
 
-/// The recessed band tone for a palette/picker header or footer strip — a
-/// translucent black so the glass still reads through (the add-space palette
-/// converged on this; measured subtler tones vanish against the dim scrim).
-pub fn band() -> gpui::Hsla {
-    gpui::hsla(0.0, 0.0, 0.0, 0.16)
+/// The recessed band tone for a palette/picker header or footer strip.
+pub fn band(theme: &Theme) -> gpui::Hsla {
+    theme.element_hover
 }
 
 /// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
@@ -679,6 +667,29 @@ pub fn error_row(theme: &Theme, message: &str) -> gpui::Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn popover_card_uses_theme_surface_and_border() {
+        let theme = Theme::dark();
+        let mut card = popover_card(&theme);
+
+        assert_eq!(card.style().background, Some(theme.surface_raised.into()));
+        assert_eq!(card.style().border_color, Some(theme.border_strong));
+    }
+
+    #[test]
+    fn menu_selection_and_band_use_theme_interaction_tokens() {
+        let mut theme = Theme::dark();
+        theme.element_active = gpui::hsla(0.6, 0.4, 0.8, 1.0);
+        theme.element_hover = gpui::hsla(0.6, 0.2, 0.9, 1.0);
+        let mut selected = menu_row(&theme, true, "selected-theme-row");
+
+        assert_eq!(
+            selected.style().background,
+            Some(theme.element_active.into())
+        );
+        assert_eq!(band(&theme), theme.element_hover);
+    }
 
     #[test]
     fn menu_step_wraps_and_enters() {

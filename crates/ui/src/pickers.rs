@@ -38,6 +38,12 @@ use crate::settings::composer::ComposerDefaults;
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
+/// The harness/model picker is visually flush with the composer controls and
+/// does not use the elevation shadow shared by the other floating popovers.
+fn harness_model_popover_card(theme: &Theme) -> gpui::Div {
+    popover::popover_card_flush(theme).shadow_none()
+}
+
 // ---------------------------------------------------------------------------
 // Draft config (what the pickers accumulate)
 // ---------------------------------------------------------------------------
@@ -1652,7 +1658,7 @@ impl Pickers {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        popover::popover_card_flush(&theme)
+        harness_model_popover_card(&theme)
             .w(px(width))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1967,14 +1973,10 @@ impl Pickers {
                             } else {
                                 theme.text_muted
                             })
-                            .when(is_viewed, |el| {
-                                el.bg(crate::theme::glass_selected_bg())
-                                    .shadow(crate::theme::glass_selected_shadows())
-                            })
+                            .when(is_viewed, |el| el.bg(theme.element_active))
                             .when(is_disabled, |el| el.opacity(0.35))
                             .when(!is_disabled, |el| {
-                                el.cursor_pointer()
-                                    .hover(|s| s.bg(crate::theme::white_alpha(0.06)))
+                                el.cursor_pointer().hover(|s| s.bg(theme.element_hover))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
@@ -2102,7 +2104,7 @@ impl Pickers {
                             .w(px(148.0))
                             .flex_none()
                             .border_r_1()
-                            .border_color(crate::theme::white_alpha(0.06))
+                            .border_color(theme.border)
                             .child(rail),
                     )
                     .child(
@@ -2147,7 +2149,7 @@ impl Pickers {
                                     .max_h(px(190.0))
                                     .overflow_y_scroll()
                                     .border_t_1()
-                                    .border_color(crate::theme::white_alpha(0.06))
+                                    .border_color(theme.border)
                                     .p(px(4.0))
                                     .child(traits),
                             ),
@@ -2157,9 +2159,9 @@ impl Pickers {
                 // The palette's legend footer, on the recessed band.
                 div()
                     .flex_none()
-                    .bg(popover::band())
+                    .bg(popover::band(&theme))
                     .border_t_1()
-                    .border_color(crate::theme::white_alpha(0.06))
+                    .border_color(theme.border)
                     .px(px(12.0))
                     .py(px(8.0))
                     .flex()
@@ -2303,7 +2305,7 @@ impl Pickers {
 /// A segmented choice chip for the traits inspector (reasoning ladder /
 /// model options): the key-cap voice — every chip carries a faint fill so it
 /// reads as a pressable segment (bare text read as labels, not buttons);
-/// the active/keyboard-highlighted chip adds the app-wide wash + glass ring.
+/// the active/keyboard-highlighted chip adds theme active fill and border.
 /// The caller adds id/click/label.
 fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
     div()
@@ -2316,16 +2318,15 @@ fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
         .text_size(px(11.5))
         .cursor_pointer()
         .when(active, |el| {
-            el.bg(crate::theme::glass_selected_bg())
-                .text_color(theme.text)
+            el.bg(theme.element_active).text_color(theme.text)
         })
         .when(!active, |el| {
-            el.bg(crate::theme::white_alpha(0.04))
+            el.bg(theme.element_hover.opacity(0.55))
                 .text_color(theme.text_muted.opacity(0.7))
                 .hover(|s| s.bg(theme.element_hover))
         })
         .when(active || highlighted, |el| {
-            el.shadow(crate::theme::glass_selected_shadows())
+            el.border_1().border_color(theme.border_strong)
         })
 }
 
@@ -2605,6 +2606,30 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use comet_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[test]
+    fn harness_model_popover_has_no_shadow() {
+        let theme = Theme::dark();
+        let mut card = harness_model_popover_card(&theme);
+        assert!(card.style().box_shadow.as_ref().map_or(true, Vec::is_empty));
+        assert_eq!(card.style().background, Some(theme.surface_raised.into()));
+        assert_eq!(card.style().border_color, Some(theme.border_strong));
+    }
+
+    #[test]
+    fn model_trait_chip_uses_theme_interaction_colors() {
+        let mut theme = Theme::dark();
+        theme.element_active = gpui::hsla(0.6, 0.4, 0.8, 1.0);
+        theme.element_hover = gpui::hsla(0.6, 0.2, 0.9, 1.0);
+        let mut active = trait_chip(&theme, true, false);
+        let mut inactive = trait_chip(&theme, false, false);
+
+        assert_eq!(active.style().background, Some(theme.element_active.into()));
+        assert_eq!(
+            inactive.style().background,
+            Some(theme.element_hover.opacity(0.55).into())
+        );
+    }
 
     #[test]
     fn traits_summary_formats_non_defaults() {

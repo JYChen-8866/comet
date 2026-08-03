@@ -1083,7 +1083,7 @@ impl Shell {
         // Header and footer sit a shade DEEPER than the body (the shared
         // recessed-band tone) — the bands frame the folder list, which stays
         // on the brighter tint.
-        let band = popover::band();
+        let band = popover::band(&theme);
         let input_row = div()
             .h(px(46.0))
             .flex_none()

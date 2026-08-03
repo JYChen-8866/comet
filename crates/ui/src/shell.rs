@@ -47,6 +47,20 @@ use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
 actions!(shell, [ToggleSidebar, AddSpacePalette]);
 
+#[derive(Debug, PartialEq)]
+enum ChatSidebarWidth {
+    Full,
+    Fixed(f32),
+}
+
+fn chat_sidebar_width(sidebar_only: bool, configured_width: f32) -> ChatSidebarWidth {
+    if sidebar_only {
+        ChatSidebarWidth::Full
+    } else {
+        ChatSidebarWidth::Fixed(configured_width)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -627,9 +641,6 @@ impl Shell {
     ) -> Self {
         let mut shell = Self::new(state, boot, cx);
         shell.sidebar_only = true;
-        // Aurin's right dock is ~300px; the comet sidebar renders at its
-        // configured width.
-        shell.settings.sidebar_width = 300.0;
         shell
     }
 
@@ -1601,9 +1612,12 @@ impl Shell {
         // ([`Shell::sidebar_row_alpha`]), dissolving the edge to pure glass.
         let glass = Theme::GLASS_ALPHA < 1.0;
         let sidebar_fade = theme.surface;
+        let sidebar = match chat_sidebar_width(self.sidebar_only, self.settings.sidebar_width) {
+            ChatSidebarWidth::Full => div().w_full(),
+            ChatSidebarWidth::Fixed(width) => div().w(px(width)),
+        };
 
-        div()
-            .w(px(self.settings.sidebar_width))
+        sidebar
             .h_full()
             .flex()
             .flex_col()
@@ -2824,6 +2838,15 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_chat_sidebar_fills_its_host_width() {
+        assert_eq!(chat_sidebar_width(true, 300.0), ChatSidebarWidth::Full);
+        assert_eq!(
+            chat_sidebar_width(false, 300.0),
+            ChatSidebarWidth::Fixed(300.0)
+        );
+    }
 
     #[test]
     fn titlebar_cluster_matches_comet_window_controls() {

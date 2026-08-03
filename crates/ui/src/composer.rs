@@ -68,6 +68,17 @@ pub const INPUT_TEXT_SIZE: f32 = 14.0;
 /// Single-select questions auto-advance after this long.
 pub const AUTO_ADVANCE_MS: u64 = 220;
 
+/// Frame styling for the permission/question prompt. Keep this local instead
+/// of using a floating popover surface: the prompt is embedded in the
+/// composer and intentionally has no elevation shadow.
+fn question_panel_frame(theme: &Theme) -> gpui::Div {
+    div()
+        .rounded(px(26.0))
+        .border_1()
+        .border_color(theme.border)
+        .bg(crate::theme::white_alpha(0.03))
+}
+
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
 /// only collapses when the text is comfortably narrower than the compact
 /// capacity — expanding and collapsing share no boundary, so a width right at
@@ -3085,17 +3096,12 @@ impl Composer {
                 })
         });
 
-        div()
+        question_panel_frame(&theme)
             .id("question-panel")
             .track_focus(&self.wizard_focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_wizard_key(event, window, cx)
             }))
-            .rounded(px(26.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(crate::theme::white_alpha(0.03))
-            .shadow_lg()
             .flex()
             .flex_col()
             .child(
@@ -3674,6 +3680,19 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_panel_has_no_shadow() {
+        let theme = Theme::dark();
+        let mut panel = question_panel_frame(&theme);
+        assert!(
+            panel
+                .style()
+                .box_shadow
+                .as_ref()
+                .map_or(true, Vec::is_empty)
+        );
+    }
 
     fn question(id: &str, options: &[&str], multi: bool) -> UserInputQuestion {
         UserInputQuestion {

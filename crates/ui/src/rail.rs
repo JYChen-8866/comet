@@ -7,7 +7,7 @@
 //! in free functions with unit tests; rendering is an `impl Transcript`
 //! extension since the rail shares the transcript's rows and `ListState`.
 
-use gpui::{AnyElement, Context, ListOffset, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, Context, Hsla, ListOffset, SharedString, div, prelude::*, px};
 use std::time::{Duration, Instant};
 
 use comet_doc::{MessagePart, MessageRole, SessionMessageEntry};
@@ -22,6 +22,10 @@ pub const RAIL_MIN_CONTAINER_WIDTH: f32 = 768.0;
 
 pub fn rail_visible(container_width: f32) -> bool {
     container_width >= RAIL_MIN_CONTAINER_WIDTH
+}
+
+fn rail_bar_color(theme: &Theme, emphasized: bool) -> Hsla {
+    theme.text.opacity(if emphasized { 0.8 } else { 0.16 })
 }
 
 /// Preview text caps (grapheme-unaware char cut is fine for a preview card).
@@ -472,11 +476,7 @@ impl Transcript {
                 // Only hover grows the tick; the active one just reads brighter
                 // (message-rail.tsx: w-3 rest, w-5 hovered).
                 let bar_width = if is_hovered { 20.0 } else { 12.0 };
-                let bar_color = if is_active || is_hovered {
-                    theme.text.opacity(0.8)
-                } else {
-                    crate::theme::white_alpha(0.16)
-                };
+                let bar_color = rail_bar_color(&theme, is_active || is_hovered);
                 let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
                 let reply = tick
                     .reply
@@ -555,6 +555,15 @@ impl Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rail_bars_follow_the_active_theme_foreground() {
+        let mut light = Theme::dark();
+        light.text = gpui::hsla(0.0, 0.0, 0.1, 1.0);
+
+        assert_eq!(rail_bar_color(&light, false), light.text.opacity(0.16));
+        assert_eq!(rail_bar_color(&light, true), light.text.opacity(0.8));
+    }
     use comet_doc::MessageStatus;
 
     fn entry(id: &str, role: MessageRole, text: &str) -> SessionMessageEntry {
