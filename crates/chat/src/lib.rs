@@ -6,4 +6,4 @@
 
 mod chat_view;
 
-pub use chat_view::{ChatConfig, ChatEvent, ChatView};
+pub use chat_view::{ChatConfig, ChatEvent, ChatView, init_tokio_from_handle};

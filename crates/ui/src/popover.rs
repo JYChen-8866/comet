@@ -484,7 +484,7 @@ pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
         .rounded(px(5.0))
         .bg(white_alpha(0.05))
         .text_size(px(10.0))
-        .font_family(Theme::dark().font_mono.clone())
+        .font_family(Theme::dark().font_mono)
         .text_color(theme.text_muted.opacity(0.6))
         .child(SharedString::from(label.to_string()))
 }

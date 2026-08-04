@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+const PAGE_CACHE_SIZE_KIB: i64 = 1024;
+
 /// Errors surfaced by [`DocsStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -49,6 +51,10 @@ impl DocsStore {
         let mut conn = Connection::open(data_dir.join("docs.sqlite3"))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // SQLite's bundled default reserves 2,000 pages (about 8 MiB with the
+        // usual 4 KiB page size). Chat snapshots are small, so keep a bounded
+        // KiB-based cache without changing persistence or transaction behavior.
+        conn.pragma_update(None, "cache_size", -PAGE_CACHE_SIZE_KIB)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut conn)?;
         Ok(Self {
@@ -156,6 +162,18 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_bounds_the_sqlite_page_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        let cache_size: i64 = store
+            .conn()
+            .pragma_query_value(None, "cache_size", |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(cache_size, -PAGE_CACHE_SIZE_KIB);
+    }
 
     #[test]
     fn snapshot_roundtrip_and_overwrite() {

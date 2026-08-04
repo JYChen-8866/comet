@@ -493,7 +493,7 @@ impl Shell {
         let glass = Theme::GLASS_ALPHA < 1.0;
         let bar_bg = theme.surface;
         let drag_move_space = space_id.clone().unwrap_or_default();
-        let drop_space = space_id.clone().unwrap_or_default();
+        let drop_space = space_id.unwrap_or_default();
         let scroll_for_drag = self.tabs_scroll.clone();
         let tab_region = div()
             .relative()

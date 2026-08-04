@@ -10,4 +10,5 @@ comet-ui.workspace = true
 comet-rpc.workspace = true
 gpui.workspace = true
 gpui_tokio.workspace = true
+tokio.workspace = true
 tracing.workspace = true

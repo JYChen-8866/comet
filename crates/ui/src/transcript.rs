@@ -1192,19 +1192,8 @@ impl Transcript {
             )
         };
 
-        eprintln!(
-            "[Transcript] sync: selected_chat={:?}, entries_count={}, echoes_count={}",
-            selected,
-            entries.len(),
-            echoes.len()
-        );
-
         let attached = selected != self.chat_id;
         if attached {
-            eprintln!(
-                "[Transcript] sync: switching chat from {:?} to {:?}",
-                self.chat_id, selected
-            );
             self.chat_id = selected;
             self.rows.clear();
             self.row_cache.clear();
@@ -1224,21 +1213,11 @@ impl Transcript {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
-        for entry in &entries {
+        for entry in entries.iter() {
             new_rows.extend(self.rows_for(entry, false));
         }
         for echo in &echoes {
             new_rows.extend(self.rows_for(echo, true));
-        }
-
-        // Log InputChip resolved status
-        for row in &new_rows {
-            if let RowKind::InputChip { header, resolved } = &row.kind {
-                eprintln!(
-                    "[Transcript] sync: InputChip row_id={}, header={}, resolved={}",
-                    row.id, header, resolved
-                );
-            }
         }
 
         // Text already streamed before this (re)attach is the veil BASELINE:
@@ -1263,16 +1242,38 @@ impl Transcript {
         // Veils live exactly as long as their live row — drop them on the
         // live→complete flip (any mid-fade chunk snaps to full, matching the
         // row's version splice).
-        self.veils.retain(|id, _| {
-            new_rows
+        {
+            let active_entry_ids = entries
                 .iter()
-                .any(|r| &r.id == id && matches!(r.kind, RowKind::LiveMarkdown { .. }))
-        });
-        self.veil_baseline.retain(|id| {
-            new_rows
+                .chain(echoes.iter())
+                .map(|entry| entry.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            self.row_cache
+                .retain(|entry_id, _| active_entry_ids.contains(entry_id.as_str()));
+
+            let active_row_ids = new_rows
                 .iter()
-                .any(|r| &r.id == id && matches!(r.kind, RowKind::LiveMarkdown { .. }))
-        });
+                .map(|row| row.id.as_ref())
+                .collect::<std::collections::HashSet<&str>>();
+            let live_row_ids = new_rows
+                .iter()
+                .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+                .map(|row| row.id.as_ref())
+                .collect::<std::collections::HashSet<&str>>();
+            self.live_parsers
+                .retain(|row_id, _| active_row_ids.contains(row_id.as_str()));
+            self.tree_cache
+                .retain(|row_id, _| active_row_ids.contains(row_id.as_str()));
+            self.highlights
+                .entries
+                .retain(|(row_id, _), _| active_row_ids.contains(row_id.as_ref()));
+            self.folds
+                .retain(|row_id, _| active_row_ids.contains(row_id.as_ref()));
+            self.veils
+                .retain(|row_id, _| live_row_ids.contains(row_id.as_ref()));
+            self.veil_baseline
+                .retain(|row_id| live_row_ids.contains(row_id.as_ref()));
+        }
 
         let was_empty = self.rows.is_empty();
         match diff_rows(&self.rows, &new_rows) {
@@ -1388,28 +1389,36 @@ impl Transcript {
                 return AttachmentSnapshot::Loaded(image);
             }
         }
-        let mut any_loading = false;
-        let mut min_retry: Option<Duration> = None;
+        let mut retry: Option<(String, Duration)> = None;
         for dev in device_ids {
-            if begin_load(dev, path) {
-                self.spawn_attachment_load(dev.clone(), path.to_string(), cx);
-            }
             match attachment_snapshot(dev, path) {
                 AttachmentSnapshot::Loaded(image) => return AttachmentSnapshot::Loaded(image),
-                AttachmentSnapshot::Loading => any_loading = true,
+                AttachmentSnapshot::Loading => {
+                    if begin_load(dev, path) {
+                        self.spawn_attachment_load(dev.clone(), path.to_string(), cx);
+                    }
+                    // A missing entry and a load claimed by another transcript
+                    // both appear as Loading. In either case, wait for this
+                    // preferred device before trying the fallback device.
+                    return AttachmentSnapshot::Loading;
+                }
                 AttachmentSnapshot::Error { retry_in } => {
-                    min_retry = Some(min_retry.map_or(retry_in, |m| m.min(retry_in)));
+                    if begin_load(dev, path) {
+                        self.spawn_attachment_load(dev.clone(), path.to_string(), cx);
+                        return AttachmentSnapshot::Loading;
+                    }
+                    if retry
+                        .as_ref()
+                        .is_none_or(|(_, current)| retry_in < *current)
+                    {
+                        retry = Some((dev.clone(), retry_in));
+                    }
                 }
             }
         }
-        if any_loading {
-            return AttachmentSnapshot::Loading;
-        }
-        match min_retry {
-            Some(retry_in) => {
-                if let Some(dev) = device_ids.first() {
-                    self.schedule_attachment_retry((dev.clone(), path.to_string()), retry_in, cx);
-                }
+        match retry {
+            Some((device_id, retry_in)) => {
+                self.schedule_attachment_retry((device_id, path.to_string()), retry_in, cx);
                 AttachmentSnapshot::Error { retry_in }
             }
             // No candidate devices at all — the "unavailable" thumb, no retry.
@@ -1434,7 +1443,13 @@ impl Transcript {
             match read_attachment_image(&engine, cx.background_executor(), target.as_deref(), &path)
                 .await
             {
-                Some(loaded) => store_loaded(&device_id, &path, loaded.name.into(), loaded.image),
+                Some(loaded) => store_loaded(
+                    &device_id,
+                    &path,
+                    loaded.name.into(),
+                    loaded.image,
+                    loaded.thumbnail,
+                ),
                 None => store_error(&device_id, &path),
             }
             this.update(cx, |transcript, cx| {
@@ -1518,7 +1533,7 @@ impl Transcript {
                             cx.notify();
                         }))
                         .child(
-                            img(image.image.clone())
+                            img(image.thumbnail.clone())
                                 .size_full()
                                 .object_fit(ObjectFit::Cover),
                         )
@@ -2220,6 +2235,7 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::attachments::retire_evicted_images(window, cx);
         // Spring driver: one on_next_frame callback at a time; each tick
         // notifies, which re-enters render and schedules the next frame until
         // the spring parks. Reduced motion never schedules (sync snaps).

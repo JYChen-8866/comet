@@ -810,11 +810,11 @@ impl Pickers {
         if row.worktree_path.is_some() {
             // Reuse the ref's existing worktree ("Current worktree") — the
             // t3code `reuseExistingWorktree` path.
-            self.config.branch = Some(row.name.clone());
+            self.config.branch = Some(row.name);
             self.config.checkout = CheckoutKind::Local;
         } else if self.config.checkout == CheckoutKind::NewWorktree || row.current {
             // Base pick for a new worktree, or the already-current ref.
-            self.config.branch = Some(row.name.clone());
+            self.config.branch = Some(row.name);
         } else {
             // Local mode + a plain non-current ref: CHECK OUT the space
             // folder (full t3code `switchRef` — picking `main` means "put my
@@ -842,7 +842,7 @@ impl Pickers {
         let local = self.state.read(cx).local_device_id.clone();
         self.switch_error = None;
         self.switching = Some(row.name.clone());
-        let ref_name = row.name.clone();
+        let ref_name = row.name;
         self.switch_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert(
@@ -914,7 +914,7 @@ impl Pickers {
         self.switch_error = None;
         self.switching = Some(row.name.clone());
         let ref_name = row.name.clone();
-        let retarget = row.worktree_path.clone();
+        let retarget = row.worktree_path;
         self.switch_task = Some(cx.spawn(async move |this, cx| {
             let result = match retarget {
                 // Reuse the ref's existing worktree: move the session there.
@@ -1956,7 +1956,7 @@ impl Pickers {
                         let is_viewed = effective == Some(harness);
                         let is_disabled = locked && !is_viewed;
                         let (icon_path, tint) = harness_brand_icon(harness);
-                        let name: SharedString = descriptor.name.clone().into();
+                        let name: SharedString = descriptor.name.into();
                         div()
                             .id(("harness-tab", ix))
                             .h(px(30.0))
@@ -2532,7 +2532,6 @@ impl Render for Pickers {
             &explicit_options,
         );
         let traits_label: SharedString = traits_set
-            .clone()
             .map(SharedString::from)
             .unwrap_or_else(|| SharedString::from("Traits"));
 

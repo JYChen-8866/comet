@@ -386,8 +386,8 @@ struct RenameChatDialog {
 
 pub struct Shell {
     state: Entity<AppState>,
-    transcript: Entity<Transcript>,
-    composer: Entity<Composer>,
+    transcript: Option<Entity<Transcript>>,
+    composer: Option<Entity<Composer>>,
     /// When true, [`Shell`] renders only the session-management sidebar (used
     /// as a host app's side panel, e.g. Aurin's right dock).
     sidebar_only: bool,
@@ -494,28 +494,43 @@ pub struct Shell {
     /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
     _ticker: Task<()>,
     _state_observation: Subscription,
-    _composer_events: Subscription,
+    _composer_events: Option<Subscription>,
 }
 
 impl Shell {
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
+        Self::new_with_mode(state, boot, false, cx)
+    }
+
+    fn new_with_mode(
+        state: Entity<AppState>,
+        boot: EngineBootConfig,
+        sidebar_only: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
             cx.notify();
         });
-        let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
-        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let transcript = (!sidebar_only).then(|| cx.new(|cx| Transcript::new(state.clone(), cx)));
+        let composer = (!sidebar_only).then(|| cx.new(|cx| Composer::new(state.clone(), cx)));
         // Own-send re-engages the stick-to-bottom pin with a smooth scroll.
-        let composer_events = cx.subscribe(&composer, {
-            let transcript = transcript.clone();
-            move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
-                ComposerEvent::Sent { .. } => {
-                    transcript.update(cx, |t, cx| t.on_own_send(cx));
-                }
-                ComposerEvent::MentionRequested { .. } => {}
-                ComposerEvent::MentionCleared => {}
-            }
-        });
+        let composer_events =
+            composer
+                .as_ref()
+                .zip(transcript.as_ref())
+                .map(|(composer, transcript)| {
+                    cx.subscribe(composer, {
+                        let transcript = transcript.clone();
+                        move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+                            ComposerEvent::Sent { .. } => {
+                                transcript.update(cx, |t, cx| t.on_own_send(cx));
+                            }
+                            ComposerEvent::MentionRequested { .. } => {}
+                            ComposerEvent::MentionCleared => {}
+                        }
+                    })
+                });
         // Working-indicator heartbeat: notify once a second while a session is
         // live so elapsed time and the flavour word stay fresh.
         let ticker = cx.spawn(async move |this, cx| {
@@ -577,7 +592,7 @@ impl Shell {
             state,
             transcript,
             composer,
-            sidebar_only: false,
+            sidebar_only,
             file_drag_active: false,
             route,
             active_chat: String::new(),
@@ -639,9 +654,19 @@ impl Shell {
         boot: EngineBootConfig,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut shell = Self::new(state, boot, cx);
-        shell.sidebar_only = true;
-        shell
+        Self::new_with_mode(state, boot, true, cx)
+    }
+
+    fn transcript(&self) -> &Entity<Transcript> {
+        self.transcript
+            .as_ref()
+            .expect("full Comet shell requires a transcript")
+    }
+
+    fn composer(&self) -> &Entity<Composer> {
+        self.composer
+            .as_ref()
+            .expect("full Comet shell requires a composer")
     }
 
     // ---- splash ----
@@ -759,7 +784,7 @@ impl Shell {
         // Chat switch: record a navigation.
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
         if selected != self.active_chat {
-            self.active_chat = selected.clone();
+            self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
             // comet's `/` route redirected into the last-used chat, leaving no
@@ -2111,7 +2136,7 @@ impl Shell {
         // → the onboarding card. The composer sits below the first two
         // (new-chat mode mints the chat id on first send).
         let outlet: AnyElement = if has_selection {
-            self.transcript.clone().into_any_element()
+            self.transcript().clone().into_any_element()
         } else if !has_spaces {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
@@ -2224,7 +2249,7 @@ impl Shell {
             .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
                 this.file_drag_active = false;
                 let paths = paths.paths().to_vec();
-                this.composer
+                this.composer()
                     .update(cx, |composer, cx| composer.add_paths(paths, cx));
                 cx.notify();
             }))
@@ -2255,7 +2280,7 @@ impl Shell {
             // Reserved status strip (h-6) — the WorkingIndicator lives here so
             // the composer below never shifts.
             .child(status)
-            .when(has_spaces, |el| el.child(self.composer.clone()))
+            .when(has_spaces, |el| el.child(self.composer().clone()))
             .when(file_drag_active, |el| {
                 el.child(
                     div()
@@ -2281,7 +2306,7 @@ impl Shell {
     /// content is left-aligned) so its bottom edge sits ~10px above the pill.
     /// Shown past the transcript's 320px threshold; 180ms fade + 2px rise in.
     fn render_jump_to_bottom(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.transcript.read(cx).jump_button_shown() {
+        if !self.transcript().read(cx).jump_button_shown() {
             return None;
         }
         let theme = Theme::of(cx);
@@ -2319,7 +2344,7 @@ impl Shell {
                         ))
                         .on_hover(motion::hover_listener("jump-pill"))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.transcript
+                            this.transcript()
                                 .update(cx, |transcript, cx| transcript.jump_to_bottom(cx));
                         }))
                         .child(
@@ -2370,7 +2395,7 @@ impl Shell {
             .and_then(|s| s.started_at)
             .map(|t| now.signed_duration_since(t).num_seconds())
             .unwrap_or(0);
-        let sending = self.composer.read(cx).is_sending();
+        let sending = self.composer().read(cx).is_sending();
 
         match indicator {
             Indicator::Working => {
@@ -2679,7 +2704,7 @@ impl Render for Shell {
         if self.focus_sub.is_none() {
             self.focus_sub = Some(cx.on_focus_lost(window, |this: &mut Shell, window, cx| {
                 match this.route {
-                    Route::Chat => window.focus(&this.composer.focus_handle(cx), cx),
+                    Route::Chat => window.focus(&this.composer().focus_handle(cx), cx),
                     // No composer here — clear the stale handle so `focused()`
                     // reads None (the render hook below re-lands focus when the
                     // route returns to Chat; a lingering unmounted handle would
@@ -2692,7 +2717,7 @@ impl Render for Shell {
             && matches!(self.route, Route::Chat)
             && window.focused(cx).is_none()
         {
-            window.focus(&self.composer.focus_handle(cx), cx);
+            window.focus(&self.composer().focus_handle(cx), cx);
         }
 
         let root = div()
@@ -2743,13 +2768,13 @@ impl Render for Shell {
                 // than in `on_state_changed`).
                 if self.debug_dialog.as_deref() == Some("model") {
                     self.debug_dialog = None;
-                    self.composer
+                    self.composer()
                         .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
                 let viewport = f32::from(window.viewport_size().width);
                 let main_width = viewport - self.sidebar_target() - 10.0;
-                self.transcript.update(cx, |t, cx| {
+                self.transcript().update(cx, |t, cx| {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx)
                 });
 

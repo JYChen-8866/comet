@@ -25,6 +25,9 @@ uuid.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+image.workspace = true
+jpeg-decoder.workspace = true
+png.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

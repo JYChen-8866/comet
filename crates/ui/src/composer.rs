@@ -2281,7 +2281,7 @@ impl Composer {
                                 cx.notify();
                             }))
                             .child(
-                                img(att.image.clone())
+                                img(att.thumbnail.clone())
                                     .size_full()
                                     .object_fit(ObjectFit::Cover),
                             ),
@@ -2552,7 +2552,7 @@ impl Composer {
             role: comet_doc::MessageRole::User,
             parts: vec![MessagePart::Text {
                 id: "t0".into(),
-                text: echo_text.clone(),
+                text: echo_text,
             }],
             created_at,
             device_id: "local".into(),
@@ -2719,9 +2719,21 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
+                        attachments::seed_attachment(
+                            &seed_device,
+                            path,
+                            &att.name,
+                            att.image.clone(),
+                            att.thumbnail.clone(),
+                        );
                         if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                            attachments::seed_attachment(
+                                &device_id,
+                                path,
+                                &att.name,
+                                att.image.clone(),
+                                att.thumbnail.clone(),
+                            );
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
@@ -2928,7 +2940,7 @@ impl Composer {
             return;
         };
         eprintln!("[Composer] wizard_finish: chat_id={}", chat_id);
-        let request_id = wizard.request_id.clone();
+        let request_id = wizard.request_id;
         let command = SessionCommandPayload::RespondInput {
             request_id: request_id.clone(),
             answers,
@@ -3272,6 +3284,7 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        attachments::retire_evicted_images(window, cx);
         let theme = Theme::of(cx).clone();
         let wizard_active = self.wizard.is_some();
         let mode = self.button_mode(cx);

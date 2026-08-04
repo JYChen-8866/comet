@@ -260,7 +260,7 @@ impl DocHost {
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
-            doc: doc.clone(),
+            doc,
             messages_tx,
             _sub: sub,
         });

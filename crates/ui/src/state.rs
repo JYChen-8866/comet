@@ -241,7 +241,7 @@ pub struct AppState {
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
-    pub transcript: Vec<SessionMessageEntry>,
+    pub transcript: Arc<[SessionMessageEntry]>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -272,7 +272,7 @@ impl AppState {
             sessions: Vec::new(),
             selected_space: None,
             selected_chat: None,
-            transcript: Vec::new(),
+            transcript: Arc::from([]),
             echoes: HashMap::new(),
             local_device_id: None,
             data_dir: None,
@@ -293,7 +293,7 @@ impl AppState {
         {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
             self.selected_chat = None;
-            self.transcript.clear();
+            self.transcript = Arc::from([]);
             self.transcript_task = None;
         }
     }
@@ -365,7 +365,7 @@ impl AppState {
         {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
-        self.transcript = entries;
+        self.transcript = entries.into();
     }
 
     /// Add an optimistic user echo (composer send path).
@@ -567,7 +567,7 @@ impl AppState {
         }
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
-        self.transcript.clear();
+        self.transcript = Arc::from([]);
         self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its space; `select_chat(None)` (the new-session
@@ -1168,7 +1168,7 @@ mod tests {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
         state.selected_chat = Some("a".into());
-        state.transcript = vec![];
+        state.transcript = Arc::from([]);
         state.apply_chats(vec![chat("b", 1, None)]);
         assert_eq!(state.selected_chat, None);
         // Still-present selection survives.

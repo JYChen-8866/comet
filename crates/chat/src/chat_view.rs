@@ -12,6 +12,27 @@ use gpui::{
     prelude::*, px,
 };
 
+static TOKIO_INIT: AtomicBool = AtomicBool::new(false);
+
+fn claim_tokio_initialization(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
+}
+
+/// Install a host-owned Tokio runtime exactly once for every embedded Comet
+/// view in this process. Calling this before constructing a [`ChatView`]
+/// prevents the component fallback from allocating its own worker pool.
+pub fn init_tokio_from_handle(cx: &mut App, handle: tokio::runtime::Handle) {
+    if claim_tokio_initialization(&TOKIO_INIT) {
+        gpui_tokio::init_from_handle(cx, handle);
+    }
+}
+
+fn ensure_tokio(cx: &mut App) {
+    if claim_tokio_initialization(&TOKIO_INIT) {
+        gpui_tokio::init(cx);
+    }
+}
+
 /// Everything a host app needs to embed the chat interface.
 #[derive(Debug, Clone)]
 pub struct ChatConfig {
@@ -94,11 +115,7 @@ impl ChatView {
     }
 
     pub fn new(config: ChatConfig, cx: &mut Context<Self>) -> Self {
-        // Host apps (Aurin) may not have initialized gpui's tokio bridge.
-        static TOKIO_INIT: AtomicBool = AtomicBool::new(false);
-        if !TOKIO_INIT.swap(true, Ordering::SeqCst) {
-            gpui_tokio::init(cx);
-        }
+        ensure_tokio(cx);
         // The comet transcript/composer render against comet-ui's own theme
         // global. Hosts (Aurin) may install a themed global before creating us;
         // only fall back to the built-in dark theme when none exists.
@@ -124,6 +141,7 @@ impl ChatView {
     /// Hosts like Aurin use this with `comet_rpc::memory_client` so there is
     /// no IPC port race and no second engine instance.
     pub fn new_with_client(client: RpcClient, config: ChatConfig, cx: &mut Context<Self>) -> Self {
+        ensure_tokio(cx);
         cx.set_global(Theme::dark());
         comet_ui::composer::init(cx);
 
@@ -145,6 +163,7 @@ impl ChatView {
         config: ChatConfig,
         cx: &mut Context<Self>,
     ) -> Self {
+        ensure_tokio(cx);
         cx.set_global(Theme::dark());
         comet_ui::composer::init(cx);
         Self::finish(state, config, cx)
@@ -205,6 +224,18 @@ impl ChatView {
             self.state
                 .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokio_runtime_initialization_is_claimed_once() {
+        let flag = AtomicBool::new(false);
+        assert!(claim_tokio_initialization(&flag));
+        assert!(!claim_tokio_initialization(&flag));
     }
 }
 

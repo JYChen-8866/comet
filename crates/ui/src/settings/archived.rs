@@ -107,7 +107,7 @@ impl Render for ArchivedPage {
                     crate::state::chat_location(&chat).map(Into::into);
                 let is_busy = busy.as_deref() == Some(chat.id.as_str());
                 let row_hovered = self.hovered == Some(ix);
-                let chat_id = chat.id.clone();
+                let chat_id = chat.id;
                 // comet settings.archived.tsx row: archive tile, medium title
                 // + tabular time, quiet device · location meta, Unarchive.
                 div()

@@ -864,7 +864,7 @@ impl Shell {
             "path": path,
             "gitDetected": git_detected,
         });
-        let submit_id = space_id.clone();
+        let submit_id = space_id;
         let task = cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::MUTATE, params).await;
             this.update(cx, |shell, cx| {
@@ -1110,7 +1110,7 @@ impl Shell {
                     .flex_1()
                     .min_w_0()
                     .text_size(px(14.0))
-                    .child(search.clone().into_any_element()),
+                    .child(search.into_any_element()),
             )
             .child(submit_chip)
             .child(
@@ -1364,7 +1364,7 @@ impl Shell {
                     _ => icons::MONITOR,
                 };
                 let name: SharedString = dev.name.clone().into();
-                let pick = dev.clone();
+                let pick = dev;
                 div()
                     .id(("add-space-device", ix))
                     .h(px(28.0))
