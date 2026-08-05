@@ -1496,6 +1496,7 @@ impl Transcript {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
+        let theme = Theme::of(cx).clone();
         let device_ids = self.attachment_device_ids(cx);
         let mut strip = div()
             .w_full()
@@ -1525,8 +1526,8 @@ impl Transcript {
                     frame
                         .id(SharedString::from(format!("{row_id}#att{aix}")))
                         .border_1()
-                        .border_color(crate::theme::white_alpha(0.11))
-                        .bg(crate::theme::white_alpha(0.035))
+                        .border_color(theme.border_strong)
+                        .bg(theme.element_hover)
                         .cursor_pointer()
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.attachment_preview = Some(preview.clone());
@@ -1543,14 +1544,14 @@ impl Transcript {
                 AttachmentSnapshot::Error { .. } => frame
                     .border_1()
                     .border_dashed()
-                    .border_color(crate::theme::white_alpha(0.14))
-                    .bg(crate::theme::white_alpha(0.025))
+                    .border_color(theme.border_strong)
+                    .bg(theme.element_hover)
                     .into_any_element(),
                 // Loading: the pulsing skeleton (same wash as popover skeletons).
                 AttachmentSnapshot::Loading => frame
                     .border_1()
-                    .border_color(crate::theme::white_alpha(0.08))
-                    .bg(crate::theme::white_alpha(0.055))
+                    .border_color(theme.border)
+                    .bg(theme.element_hover)
                     .with_animation(
                         SharedString::from(format!("{row_id}#att-pulse{aix}")),
                         motion::COMET_PULSE.repeating(),
@@ -1913,7 +1914,7 @@ impl Transcript {
             // chips (destructive tint, comet tool-chip.tsx) and in the
             // summary's "· N failed" count.
             .text_color(theme.text_muted)
-            .hover(|s| s.text_color(Theme::dark().text))
+            .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_fold(toggle_id.clone(), tool_count, auto_open);
                 cx.notify();
@@ -1923,7 +1924,7 @@ impl Transcript {
                     .size(px(18.0))
                     .flex_none()
                     .rounded(px(5.0))
-                    .bg(crate::theme::white_alpha(0.06))
+                    .bg(theme.element_hover)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1990,7 +1991,6 @@ impl Transcript {
 /// "Error" label, then the human message truncating at `text-foreground/80` —
 /// a subtle red-tinted wash, never a bare red-stroke box.
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
-    let red_300 = crate::theme::oklch(0.808, 0.114, 19.571); // tailwind red-300
     let danger = theme.danger; // red-400
     div()
         .py(px(4.0))
@@ -2021,14 +2021,14 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                         .child(
                             crate::icons::icon(crate::icons::DANGER_TRIANGLE)
                                 .size(px(12.0))
-                                .text_color(red_300.opacity(0.8)),
+                                .text_color(danger),
                         ),
                 )
                 .child(
                     div()
                         .flex_none()
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(red_300.opacity(0.8))
+                        .text_color(danger)
                         .child(SharedString::from("Error")),
                 )
                 .child(
@@ -2069,8 +2069,8 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
                 .overflow_hidden()
                 .rounded(px(10.0))
                 .border_1()
-                .border_color(crate::theme::white_alpha(0.08))
-                .bg(crate::theme::white_alpha(0.045))
+                .border_color(theme.border)
+                .bg(theme.element_hover)
                 .px(px(8.0))
                 .text_size(px(12.0))
                 .child(
@@ -2078,7 +2078,7 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
                         .flex_none()
                         .size(px(20.0))
                         .rounded(px(6.0))
-                        .bg(crate::theme::white_alpha(0.09))
+                        .bg(theme.element_active)
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2148,7 +2148,7 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                 .h_full()
                 .w(px(1.0))
                 .flex_none()
-                .bg(crate::theme::white_alpha(0.08)),
+                .bg(theme.border),
         )
         .child(
             div()
@@ -2163,8 +2163,8 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                 .overflow_hidden()
                 .rounded(px(9.0))
                 .border_1()
-                .border_color(crate::theme::white_alpha(0.07))
-                .bg(crate::theme::white_alpha(0.03))
+                .border_color(theme.border)
+                .bg(theme.element_hover)
                 .px(px(8.0))
                 .text_size(px(12.0))
                 .child(
@@ -2174,7 +2174,7 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                         .size(px(18.0))
                         .flex_none()
                         .rounded(px(5.0))
-                        .bg(crate::theme::white_alpha(0.08))
+                        .bg(theme.element_active)
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2279,6 +2279,7 @@ impl Render for Transcript {
         if let Some(preview) = self.attachment_preview.clone() {
             let weak = cx.weak_entity();
             return root.child(crate::attachments::lightbox(
+                Theme::of(cx),
                 window.viewport_size(),
                 &preview,
                 move |_, cx| {

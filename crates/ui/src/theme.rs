@@ -1,4 +1,4 @@
-//! Always-dark monochrome theme — concrete values, no indirection.
+//! Comet theme tokens with a built-in dark fallback.
 //!
 //! Colors are precomputed from an oklch-derived neutral scale (perceptually even
 //! lightness steps; the same scale comet's Tailwind theme used) into gpui [`Hsla`].
@@ -6,8 +6,9 @@
 //! layout, colors are paint**: layout constants live here as plain numbers and never
 //! depend on which color is painted.
 //!
-//! Installed as a gpui [`Global`] at boot (`cx.set_global(Theme::dark())`); read with
-//! [`Theme::of`].
+//! Standalone Comet installs [`Theme::dark`] at boot. Embedded hosts may
+//! install their own palette before constructing the chat and all production
+//! UI reads it through [`Theme::of`].
 
 use gpui::{App, Global, Hsla, SharedString, hsla};
 
@@ -29,6 +30,8 @@ pub struct Theme {
     pub border: Hsla,
     /// Stronger border for focused/raised edges.
     pub border_strong: Hsla,
+    /// Full-window modal and drag/drop scrim.
+    pub overlay: Hsla,
 
     // ---- paint: text ----
     /// Primary text.
@@ -37,12 +40,18 @@ pub struct Theme {
     pub text_muted: Hsla,
     /// Faint text: placeholders, disabled.
     pub text_faint: Hsla,
+    /// Text-input selection background.
+    pub selection: Hsla,
+    /// Text-input caret.
+    pub caret: Hsla,
 
     // ---- paint: accents ----
     /// Accent — indigo (working indicator, links, selection tint).
     pub accent: Hsla,
     /// Stronger accent for fills.
     pub accent_strong: Hsla,
+    /// Foreground placed on accent, danger, warning, and success fills.
+    pub on_accent: Hsla,
     /// Danger — red (errors, stop button).
     pub danger: Hsla,
     /// Warning — amber (offline notices, awaiting-input).
@@ -95,16 +104,26 @@ impl Theme {
     pub const SPACE_MD: f32 = 12.0;
     pub const SPACE_LG: f32 = 16.0;
 
-    /// The frost tint painted over the blurred window background (macOS
-    /// glass). Darker than `surface` — matched to the reference dark
-    /// vibrancy scrim: `hsl(0 0% 3%)` (#080808) at [`Self::GLASS_ALPHA`].
-    /// On opaque platforms this IS the surface tone (no tint swap).
+    /// The active surface tint painted over the blurred window background.
+    /// On opaque platforms this is the surface tone unchanged.
     pub fn glass(&self) -> Hsla {
         if Self::GLASS_ALPHA < 1.0 {
-            grey(8).opacity(Self::GLASS_ALPHA)
+            self.surface.opacity(Self::GLASS_ALPHA)
         } else {
             self.surface
         }
+    }
+
+    /// Inset outline for selected glass controls, derived from the active
+    /// theme rather than the built-in dark palette.
+    pub fn selected_shadows(&self) -> Vec<gpui::BoxShadow> {
+        vec![gpui::BoxShadow {
+            color: self.border_strong,
+            offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+            blur_radius: gpui::px(0.0),
+            spread_radius: gpui::px(1.0),
+            inset: true,
+        }]
     }
 
     /// Build the (only) theme. The surface tones are sampled straight from the
@@ -119,14 +138,18 @@ impl Theme {
             element_active: wash(0.16),
             border: white_alpha(0.08),
             border_strong: white_alpha(0.14),
-            text: neutral(0.922),                        // ~neutral-200
-            text_muted: neutral(0.708),                  // ~neutral-400
-            text_faint: neutral(0.556),                  // ~neutral-500
-            accent: oklch(0.673, 0.182, 276.935),        // indigo-400
+            overlay: hsla(0.0, 0.0, 0.0, 0.6),
+            text: neutral(0.922),       // ~neutral-200
+            text_muted: neutral(0.708), // ~neutral-400
+            text_faint: neutral(0.556), // ~neutral-500
+            selection: oklch(0.585, 0.233, 277.117).opacity(0.35),
+            caret: oklch(0.673, 0.182, 276.935),
+            accent: oklch(0.673, 0.182, 276.935), // indigo-400
             accent_strong: oklch(0.585, 0.233, 277.117), // indigo-500
-            danger: oklch(0.704, 0.191, 22.216),         // red-400
-            warning: oklch(0.828, 0.189, 84.429),        // amber-400
-            success: oklch(0.768, 0.188, 149.5),         // green-400
+            on_accent: grey(255),
+            danger: oklch(0.704, 0.191, 22.216),  // red-400
+            warning: oklch(0.828, 0.189, 84.429), // amber-400
+            success: oklch(0.768, 0.188, 149.5),  // green-400
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
             font_sans_fallback: system_sans().into(),
@@ -347,6 +370,26 @@ mod tests {
             assert_eq!(c.s, 0.0);
             assert_eq!(c.a, 1.0);
         }
+    }
+
+    #[test]
+    fn interaction_paint_tokens_are_visible() {
+        let t = Theme::dark();
+        assert!(t.overlay.a > 0.0);
+        assert!(t.selection.a > 0.0);
+        assert!(t.caret.a > 0.0);
+    }
+
+    #[test]
+    fn glass_uses_the_active_surface_color() {
+        let mut t = Theme::dark();
+        t.surface = hsla(0.32, 0.45, 0.78, 1.0);
+        let glass = t.glass();
+        assert_eq!(
+            (glass.h, glass.s, glass.l),
+            (t.surface.h, t.surface.s, t.surface.l)
+        );
+        assert_eq!(glass.a, Theme::GLASS_ALPHA);
     }
 
     #[test]

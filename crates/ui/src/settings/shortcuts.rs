@@ -183,7 +183,7 @@ impl Render for ShortcutsPage {
                             .text_size(px(11.0))
                             .text_color(theme.text_muted.opacity(0.7))
                             .cursor_pointer()
-                            .hover(|s| s.text_color(Theme::dark().text))
+                            .hover(|s| s.text_color(theme.text))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.keymap.reset(id);
                                 this.recording = None;
@@ -209,7 +209,7 @@ impl Render for ShortcutsPage {
                             if is_recording {
                                 el.border_color(theme.text.opacity(0.3))
                                     .bg(theme.text)
-                                    .text_color(crate::theme::grey(0x0e))
+                                    .text_color(theme.on_accent)
                             } else {
                                 el.border_color(theme.border)
                                     .bg(theme.bg)
@@ -218,7 +218,7 @@ impl Render for ShortcutsPage {
                                         // `hover:border-foreground/20` — the
                                         // neutral foreground, not pure white.
                                         s.border_color(theme.text.opacity(0.2))
-                                            .bg(crate::theme::white_alpha(0.03))
+                                            .bg(theme.element_hover)
                                     })
                             }
                         })
@@ -285,8 +285,7 @@ impl Render for ShortcutsPage {
                                     .when(disabled, |el| el.opacity(0.35))
                                     .when(!disabled, |el| {
                                         el.hover(|s| {
-                                            s.bg(crate::theme::white_alpha(0.04))
-                                                .text_color(Theme::dark().text)
+                                            s.bg(theme.element_hover).text_color(theme.text)
                                         })
                                         .on_click(
                                             cx.listener(|this, _, _, cx| {

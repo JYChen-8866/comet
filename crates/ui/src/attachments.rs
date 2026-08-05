@@ -25,7 +25,6 @@ use gpui::{
 };
 
 use crate::state::EngineHandle;
-use crate::theme::white_alpha;
 use comet_rpc::methods;
 
 /// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
@@ -907,6 +906,7 @@ pub struct PreviewImage {
 /// it. Any click closes (the whole dialog is the close button, as in the
 /// original's `cursor-zoom-out` figure).
 pub fn lightbox(
+    theme: &crate::theme::Theme,
     viewport: Size<gpui::Pixels>,
     preview: &PreviewImage,
     on_close: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
@@ -922,7 +922,7 @@ pub fn lightbox(
                     .occlude()
                     .w(viewport.width)
                     .h(viewport.height)
-                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.7))
+                    .bg(theme.overlay)
                     .flex()
                     .flex_col()
                     .items_center()
@@ -943,7 +943,7 @@ pub fn lightbox(
                             .max_w(max_w)
                             .overflow_hidden()
                             .text_size(px(11.0))
-                            .text_color(white_alpha(0.45))
+                            .text_color(theme.text_muted)
                             .child(preview.name.clone()),
                     ),
             ),

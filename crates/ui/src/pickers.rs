@@ -1418,7 +1418,7 @@ impl Pickers {
                 } else {
                     theme.text_muted
                 },
-                Theme::dark().text,
+                theme.text,
             ))
             .bg(if open {
                 theme.element_hover
@@ -1818,7 +1818,7 @@ impl Pickers {
         // git's own message, under a hairline.
         if let Some(error) = &self.switch_error {
             popover = popover.child(
-                popover::menu_section().child(
+                popover::menu_section(&theme).child(
                     div()
                         .px(px(Theme::SPACE_SM))
                         .py(px(4.0))
@@ -1830,7 +1830,7 @@ impl Pickers {
         }
         if total > shown {
             popover = popover.child(
-                popover::menu_section().child(
+                popover::menu_section(&theme).child(
                     div()
                         .px(px(Theme::SPACE_SM))
                         .py(px(4.0))
@@ -2026,7 +2026,7 @@ impl Pickers {
                             format!("model-row-{ix}"),
                         )
                         .when(is_selected || ix == active, |el| {
-                            el.shadow(crate::theme::glass_selected_shadows())
+                            el.shadow(theme.selected_shadows())
                         })
                         .id(("model-row", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2357,9 +2357,9 @@ fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
         .h(px(18.0))
         .rounded_full()
         .bg(if on {
-            theme.text
+            theme.accent
         } else {
-            crate::theme::white_alpha(0.15)
+            theme.element_active
         })
         .relative()
         .child(
@@ -2370,9 +2370,9 @@ fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
                 .size(px(14.0))
                 .rounded_full()
                 .bg(if on {
-                    crate::theme::grey(0x0e)
+                    theme.on_accent
                 } else {
-                    crate::theme::white_alpha(0.7)
+                    theme.text_muted
                 }),
         )
 }

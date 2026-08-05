@@ -114,18 +114,14 @@ pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
     match status {
         // Pink, not amber — the harsh yellow read as a warning; running is
         // routine (user request).
-        ChatIndicator::Working => {
-            crate::theme::oklch(0.718, 0.202, 349.761).opacity(0.85) // pink-400
-        }
+        ChatIndicator::Working => theme.warning,
         // Blue: "asking you a question" must read differently from "busy
         // working" at a glance.
         ChatIndicator::AwaitingInput => theme.accent.opacity(0.9),
         ChatIndicator::Errored => theme.danger,
         // Green: finished-but-unseen reads as "ready for you".
-        ChatIndicator::Completed => {
-            crate::theme::oklch(0.765, 0.177, 163.223).opacity(0.9) // emerald-400
-        }
-        ChatIndicator::Idle => crate::theme::white_alpha(0.14),
+        ChatIndicator::Completed => theme.success,
+        ChatIndicator::Idle => theme.text_muted.opacity(0.35),
     }
 }
 
@@ -278,8 +274,8 @@ impl Shell {
                     .cursor_pointer()
                     .bg(motion::hover_blend(
                         "add-space",
-                        crate::theme::wash(0.0),
-                        crate::theme::wash(0.14),
+                        theme.element_hover.opacity(0.0),
+                        theme.element_hover,
                     ))
                     .on_hover(motion::hover_listener("add-space"))
                     .on_click(cx.listener(|this, _, _, cx| this.start_new_session(cx)))
@@ -308,12 +304,12 @@ impl Shell {
                     .text_color(motion::hover_blend(
                         "add-space-ghost",
                         theme.text_muted,
-                        Theme::dark().text,
+                        theme.text,
                     ))
                     .bg(motion::hover_blend(
                         "add-space-ghost",
-                        crate::theme::wash(0.0),
-                        Theme::dark().element_hover,
+                        theme.element_hover.opacity(0.0),
+                        theme.element_hover,
                     ))
                     .on_hover(motion::hover_listener("add-space-ghost"))
                     .cursor_pointer()
@@ -469,9 +465,9 @@ impl Shell {
         let name: SharedString = space.display_name().to_string().into();
         let fade_key = format!("space-row-{id}");
         let rest_bg = if selected {
-            crate::theme::glass_selected_bg()
+            theme.element_active
         } else {
-            crate::theme::wash(0.0)
+            theme.element_hover.opacity(0.0)
         };
         let rest_text = if selected {
             theme.text
@@ -494,9 +490,7 @@ impl Shell {
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
             .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
-            .when(selected, |el| {
-                el.shadow(crate::theme::glass_selected_shadows())
-            })
+            .when(selected, |el| el.shadow(theme.selected_shadows()))
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -526,7 +520,7 @@ impl Shell {
             .child(
                 div().size(px(6.0)).rounded_full().flex_none().bg(attention
                     .map(|status| status_dot_color(status, theme))
-                    .unwrap_or_else(|| crate::theme::white_alpha(0.14))),
+                    .unwrap_or_else(|| theme.text_muted.opacity(0.35))),
             )
             .child(
                 icon(icons::FOLDER)
@@ -1018,7 +1012,7 @@ impl Shell {
         let devices = self.state.read(cx).devices.clone();
         let rows = self.add_space_filtered(cx);
         let query_empty = search.read(cx).is_empty();
-        let hairline = crate::theme::white_alpha(0.06);
+        let hairline = theme.border;
         let now = Utc::now();
         // (browsed device name, online) per rail row — presence is the same
         // signal the sidebar space rows use.
@@ -1046,7 +1040,7 @@ impl Shell {
                 .flex_row()
                 .items_center()
                 .gap(px(2.0))
-                .bg(crate::theme::white_alpha(0.05))
+                .bg(theme.element_hover)
                 .text_size(px(11.0))
                 .font_family(theme.font_mono.clone())
                 .text_color(theme.text_muted.opacity(0.7))
@@ -1075,7 +1069,7 @@ impl Shell {
                 el.child(
                     icon(icons::COMMAND)
                         .size(px(11.0))
-                        .text_color(crate::theme::grey(0x0e).opacity(0.8)),
+                        .text_color(theme.on_accent.opacity(0.8)),
                 )
                 .child(SharedString::from("Enter"))
             })
@@ -1117,7 +1111,7 @@ impl Shell {
                 key_chip(&theme)
                     .id("add-space-esc")
                     .cursor_pointer()
-                    .hover(|s| s.bg(crate::theme::white_alpha(0.09)))
+                    .hover(|s| s.bg(theme.element_active))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.add_space = None;
                         cx.notify();
@@ -1168,7 +1162,7 @@ impl Shell {
                             crumb
                                 .text_color(theme.text_muted.opacity(0.55))
                                 .cursor_pointer()
-                                .hover(|s| s.text_color(Theme::dark().text))
+                                .hover(|s| s.text_color(theme.text))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if let Some(flow) = this.add_space.as_mut() {
                                         flow.browser_repo = false;
@@ -1206,7 +1200,7 @@ impl Shell {
                                     } else {
                                         crumb
                                             .cursor_pointer()
-                                            .hover(|s| s.text_color(Theme::dark().text))
+                                            .hover(|s| s.text_color(theme.text))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 if let Some(flow) = this.add_space.as_mut() {
                                                     flow.browser_repo = false;
@@ -1301,9 +1295,7 @@ impl Shell {
                             )
                             // The active-tab/session selection language: the wash
                             // plus the ring-only inset outline.
-                            .when(ix == active, |el| {
-                                el.shadow(crate::theme::glass_selected_shadows())
-                            })
+                            .when(ix == active, |el| el.shadow(theme.selected_shadows()))
                             .id(("add-space-folder", ix))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.add_space_descend(full.clone(), is_repo, cx);
@@ -1379,8 +1371,8 @@ impl Shell {
                     .when(is_active, |el| {
                         // The sidebar's selection language: glass wash +
                         // ring-only inset outline.
-                        el.bg(crate::theme::glass_selected_bg())
-                            .shadow(crate::theme::glass_selected_shadows())
+                        el.bg(theme.element_active)
+                            .shadow(theme.selected_shadows())
                             .text_color(theme.text)
                     })
                     .when(!is_active, |el| {
@@ -1405,16 +1397,15 @@ impl Shell {
                             .when(online, |el| {
                                 // The Devices-page presence emerald, soft glow
                                 // included.
-                                let emerald = crate::theme::oklch(0.765, 0.177, 163.223);
-                                el.bg(emerald.opacity(0.9)).shadow(vec![gpui::BoxShadow {
-                                    color: emerald.opacity(0.55),
+                                el.bg(theme.success).shadow(vec![gpui::BoxShadow {
+                                    color: theme.success.opacity(0.55),
                                     offset: gpui::point(px(0.0), px(0.0)),
                                     blur_radius: px(6.0),
                                     spread_radius: px(0.0),
                                     inset: false,
                                 }])
                             })
-                            .when(!online, |el| el.bg(crate::theme::white_alpha(0.22))),
+                            .when(!online, |el| el.bg(theme.text_muted.opacity(0.4))),
                     )
             }))
             .child(div().h(px(1.0)).mx(px(2.0)).my(px(6.0)).bg(hairline))
@@ -1496,14 +1487,14 @@ impl Shell {
                 .w(px(680.0))
                 .rounded(px(14.0))
                 .border_1()
-                .border_color(crate::theme::white_alpha(0.10))
+                .border_color(theme.border_strong)
                 // The popover_card glass recipe: a translucent tint over the
                 // frosted backdrop blur (`popover::modal` wraps in `frosted`) —
                 // an opaque fill here killed the vibrancy every other float has.
                 .bg(if Theme::GLASS_ALPHA < 1.0 {
-                    crate::theme::grey(0x16).opacity(0.65)
+                    theme.surface_raised.opacity(0.65)
                 } else {
-                    crate::theme::grey(0x16)
+                    theme.surface_raised
                 })
                 .shadow_lg()
                 .overflow_hidden()
@@ -1527,7 +1518,7 @@ impl Shell {
                 .child(body)
                 .child(footer)
                 .into_any_element();
-        Some(popover::modal("add-space-dialog", viewport, card))
+        Some(popover::modal(&theme, "add-space-dialog", viewport, card))
     }
 
     // ---- space context menu / rename / delete overlays ----
@@ -1610,7 +1601,7 @@ impl Shell {
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
                 )
-                .child(popover::menu_separator())
+                .child(popover::menu_separator(&theme))
                 .child(
                     popover::menu_row(&theme, false, format!("space-menu-delete-{space_id}"))
                         .id("space-menu-delete")
@@ -1647,7 +1638,7 @@ impl Shell {
                 .child(
                     div()
                         .mt(px(12.0))
-                        .child(popover::dialog_field(input.into_any_element())),
+                        .child(popover::dialog_field(&theme, input.into_any_element())),
                 )
                 .child(
                     div()
@@ -1673,7 +1664,12 @@ impl Shell {
                         ),
                 )
                 .into_any_element();
-            overlays.push(popover::modal("rename-space-dialog", viewport, card));
+            overlays.push(popover::modal(
+                &theme,
+                "rename-space-dialog",
+                viewport,
+                card,
+            ));
         }
 
         if let Some(space_id) = self.delete_space_confirm.clone() {
@@ -1727,7 +1723,12 @@ impl Shell {
                         ),
                 )
                 .into_any_element();
-            overlays.push(popover::modal("delete-space-dialog", viewport, card));
+            overlays.push(popover::modal(
+                &theme,
+                "delete-space-dialog",
+                viewport,
+                card,
+            ));
         }
 
         overlays

@@ -1340,7 +1340,7 @@ impl Shell {
                                 .py(px(6.0))
                                 .text_size(px(13.0))
                                 .when(selected, |el| {
-                                    el.bg(crate::theme::wash(0.17))
+                                    el.bg(theme.element_active)
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                 })
                                 .text_color(if selected {
@@ -1349,10 +1349,7 @@ impl Shell {
                                     theme.text_muted
                                 })
                                 .cursor_pointer()
-                                .hover(|s| {
-                                    s.bg(crate::theme::wash(0.11))
-                                        .text_color(Theme::dark().text)
-                                })
+                                .hover(|s| s.bg(theme.element_hover).text_color(theme.text))
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
                                 )
@@ -1380,10 +1377,7 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
-                        .hover(|s| {
-                            s.bg(crate::theme::wash(0.11))
-                                .text_color(Theme::dark().text)
-                        })
+                        .hover(|s| s.bg(theme.element_hover).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
                             // AltArrowLeft chevron (comet settings-sidebar.tsx),
@@ -1441,7 +1435,7 @@ impl Shell {
                 .into_any_element()
         };
         let (hover, text) = (theme.element_hover, theme.text);
-        let selected_wash = crate::theme::glass_selected_bg();
+        let selected_wash = theme.element_active;
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
         let menu_id = id.clone();
@@ -1451,7 +1445,7 @@ impl Shell {
         let rest_bg = if selected {
             selected_wash
         } else {
-            crate::theme::wash(0.0)
+            theme.element_hover.opacity(0.0)
         };
         let rest_text = if selected { text } else { text.opacity(0.8) };
         div()
@@ -1464,9 +1458,7 @@ impl Shell {
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover))
-            .when(selected, |el| {
-                el.shadow(crate::theme::glass_selected_shadows())
-            })
+            .when(selected, |el| el.shadow(theme.selected_shadows()))
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1684,7 +1676,7 @@ impl Shell {
                                     .font_weight(gpui::FontWeight::MEDIUM)
                                     .text_color(theme.text)
                                     .cursor_pointer()
-                                    .hover(|s| s.bg(crate::theme::white_alpha(0.06)))
+                                    .hover(|s| s.bg(theme.element_hover))
                                     .on_click(
                                         cx.listener(|this, _, _, cx| this.start_new_session(cx)),
                                     )
@@ -1809,8 +1801,8 @@ impl Shell {
             } else {
                 motion::hover_blend(
                     "user-menu-trigger",
-                    crate::theme::wash(0.0),
-                    crate::theme::wash(0.11),
+                    theme.element_hover.opacity(0.0),
+                    theme.element_hover,
                 )
             })
             .on_hover(motion::hover_listener("user-menu-trigger"))
@@ -1948,7 +1940,7 @@ impl Shell {
                         )
                         .child(SharedString::from("Archive")),
                 )
-                .child(popover::menu_separator())
+                .child(popover::menu_separator(&theme))
                 .child(
                     popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
                         .id("chat-menu-delete")
@@ -1985,7 +1977,7 @@ impl Shell {
                 .child(
                     div()
                         .mt(px(12.0))
-                        .child(popover::dialog_field(input.into_any_element())),
+                        .child(popover::dialog_field(&theme, input.into_any_element())),
                 )
                 .child(
                     div()
@@ -2011,7 +2003,7 @@ impl Shell {
                         ),
                 )
                 .into_any_element();
-            overlays.push(popover::modal("rename-chat-dialog", viewport, card));
+            overlays.push(popover::modal(&theme, "rename-chat-dialog", viewport, card));
         }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
@@ -2060,7 +2052,7 @@ impl Shell {
                         ),
                 )
                 .into_any_element();
-            overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+            overlays.push(popover::modal(&theme, "delete-chat-dialog", viewport, card));
         }
 
         overlays
@@ -2286,7 +2278,7 @@ impl Shell {
                     div()
                         .absolute()
                         .inset_0()
-                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.4))
+                        .bg(theme.overlay)
                         .flex()
                         .items_center()
                         .justify_center()
@@ -2340,7 +2332,7 @@ impl Shell {
                         .bg(motion::hover_blend(
                             "jump-pill",
                             theme.surface_raised,
-                            crate::theme::neutral(0.29),
+                            theme.element_hover,
                         ))
                         .on_hover(motion::hover_listener("jump-pill"))
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -2463,7 +2455,7 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text)
                         .cursor_pointer()
-                        .hover(|s| s.bg(Theme::dark().element_hover))
+                        .hover(|s| s.bg(theme.element_hover))
                         .on_click(cx.listener(|this, _, _, cx| this.retry_engine(cx)))
                         .child(SharedString::from("Retry")),
                 )
@@ -2495,7 +2487,7 @@ impl Shell {
 /// 44px hairlines at white 3.5%, with the radial mask approximated by edge
 /// gradients back into the page background (gpui has no mask-image).
 fn grid_backdrop(theme: &Theme) -> AnyElement {
-    let line = crate::theme::white_alpha(0.035);
+    let line = theme.border.opacity(0.45);
     let bg = theme.bg;
     const STEP: f32 = 44.0;
     const SPAN: f32 = 2640.0;
@@ -2602,8 +2594,8 @@ fn window_control_button(
         // comet window-controls.tsx: `transition-colors` — the wash fades.
         .bg(motion::hover_blend(
             &fade_key,
-            crate::theme::wash(0.0),
-            Theme::dark().element_hover,
+            theme.element_hover.opacity(0.0),
+            theme.element_hover,
         ))
         .on_hover(motion::hover_listener(fade_key))
         // Buttons in/over a titlebar drag strip must be EXCLUDED from the

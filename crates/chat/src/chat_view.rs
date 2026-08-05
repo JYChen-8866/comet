@@ -142,7 +142,9 @@ impl ChatView {
     /// no IPC port race and no second engine instance.
     pub fn new_with_client(client: RpcClient, config: ChatConfig, cx: &mut Context<Self>) -> Self {
         ensure_tokio(cx);
-        cx.set_global(Theme::dark());
+        if !cx.has_global::<Theme>() {
+            cx.set_global(Theme::dark());
+        }
         comet_ui::composer::init(cx);
 
         let state = cx.new(|_| AppState::new());
@@ -164,7 +166,9 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) -> Self {
         ensure_tokio(cx);
-        cx.set_global(Theme::dark());
+        if !cx.has_global::<Theme>() {
+            cx.set_global(Theme::dark());
+        }
         comet_ui::composer::init(cx);
         Self::finish(state, config, cx)
     }

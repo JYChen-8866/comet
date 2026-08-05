@@ -76,7 +76,7 @@ fn question_panel_frame(theme: &Theme) -> gpui::Div {
         .rounded(px(26.0))
         .border_1()
         .border_color(theme.border)
-        .bg(crate::theme::white_alpha(0.03))
+        .bg(theme.element_hover)
 }
 
 /// Hysteresis slack for the expanded→compact flip: once expanded, the composer
@@ -1342,8 +1342,8 @@ impl ComposerInput {
         let font_size = style.font_size.to_pixels(window.rem_size());
         self.line_height = px(INPUT_LINE_HEIGHT);
 
-        let run_for = |len: usize, underline: bool, mention: bool| {
-            let color = if mention { gpui::white() } else { style.color };
+        let run_for = |len: usize, underline: bool, _mention: bool| {
+            let color = style.color;
             TextRun {
                 len,
                 font: style.font(),
@@ -1707,7 +1707,8 @@ impl gpui::Element for ComposerTextElement {
         let input = self.input.read(cx);
         let scroll = px(input.scroll_top);
         let origin = point(bounds.left(), bounds.top() - scroll);
-        let selection_color = gpui::hsla(0.66, 0.6, 0.55, 0.35);
+        let theme = Theme::of(cx);
+        let selection_color = theme.selection;
 
         let mut selection_quads = Vec::new();
         let mut cursor = None;
@@ -1718,12 +1719,12 @@ impl gpui::Element for ComposerTextElement {
                         point(origin.x + p.x, origin.y + p.y),
                         size(px(2.0), input.line_height),
                     ),
-                    gpui::hsla(0.66, 0.7, 0.7, 1.0),
+                    theme.caret,
                 ));
             } else if input.display_is_placeholder {
                 cursor = Some(fill(
                     Bounds::new(origin, size(px(2.0), input.line_height)),
-                    gpui::hsla(0.66, 0.7, 0.7, 1.0),
+                    theme.caret,
                 ));
             }
         } else if let (Some(start), Some(end)) = (
@@ -2274,7 +2275,7 @@ impl Composer {
                             .rounded(px(8.0))
                             .overflow_hidden()
                             .border_1()
-                            .border_color(crate::theme::white_alpha(0.10))
+                            .border_color(theme.border_strong)
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.preview = Some(preview.clone());
@@ -3052,18 +3053,18 @@ impl Composer {
                 .rounded(px(12.0))
                 .border_1()
                 .border_color(if picked {
-                    crate::theme::white_alpha(0.16)
+                    theme.border_strong
                 } else {
                     gpui::transparent_black()
                 })
                 // comet question-panel.tsx option rows: `transition-colors`.
                 .bg(if picked {
-                    crate::theme::white_alpha(0.09)
+                    theme.element_active
                 } else {
                     motion::hover_blend(
                         &format!("wizard-option-{ix}"),
-                        crate::theme::white_alpha(0.025),
-                        crate::theme::white_alpha(0.06),
+                        theme.element_hover.opacity(0.35),
+                        theme.element_hover,
                     )
                 })
                 .on_hover(motion::hover_listener(format!("wizard-option-{ix}")))
@@ -3093,9 +3094,9 @@ impl Composer {
                             .justify_center()
                             .rounded(px(6.0))
                             .bg(if picked {
-                                crate::theme::white_alpha(0.16)
+                                theme.element_active
                             } else {
-                                crate::theme::white_alpha(0.05)
+                                theme.element_hover
                             })
                             .text_size(px(11.0))
                             .text_color(if picked {
@@ -3146,7 +3147,7 @@ impl Composer {
                                         .flex()
                                         .items_center()
                                         .rounded(px(6.0))
-                                        .bg(crate::theme::white_alpha(0.06))
+                                        .bg(theme.element_hover)
                                         .text_size(px(10.0))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .text_color(theme.text_muted.opacity(0.6))
@@ -3194,7 +3195,7 @@ impl Composer {
                         div()
                             .mt(px(12.0))
                             .border_t_1()
-                            .border_color(crate::theme::white_alpha(0.06))
+                            .border_color(theme.border)
                             .pt(px(12.0))
                             .pb(px(4.0))
                             .px(px(4.0))
@@ -3409,20 +3410,10 @@ impl Render for Composer {
                 let offline = message.as_ref() == "Engine not connected";
                 let (border_c, wash, text_c) = if offline {
                     let amber = theme.warning; // amber-400
-                    let amber_200 = crate::theme::oklch(0.924, 0.12, 95.746);
-                    (
-                        amber.opacity(0.16),
-                        amber.opacity(0.05),
-                        amber_200.opacity(0.9),
-                    )
+                    (amber.opacity(0.16), amber.opacity(0.05), amber)
                 } else {
                     let danger = theme.danger; // red-400
-                    let red_300 = crate::theme::oklch(0.808, 0.114, 19.571);
-                    (
-                        danger.opacity(0.16),
-                        danger.opacity(0.05),
-                        red_300.opacity(0.9),
-                    )
+                    (danger.opacity(0.16), danger.opacity(0.05), danger)
                 };
                 el.child(
                     div()
@@ -3515,8 +3506,8 @@ impl Render for Composer {
             // comet composer-actions.tsx attach: `transition-colors`.
             .bg(motion::hover_blend(
                 "composer-attach",
-                gpui::transparent_black(),
-                crate::theme::white_alpha(0.10),
+                theme.element_hover.opacity(0.0),
+                theme.element_hover,
             ))
             .on_hover(motion::hover_listener("composer-attach"))
             .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
@@ -3533,7 +3524,7 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Picker chips,
         // attach, and the send circle all live INSIDE the pill.
-        let pill_bg = crate::theme::white_alpha(0.03);
+        let pill_bg = theme.element_hover;
         let pill = div()
             .rounded(px(26.0))
             .bg(pill_bg)
@@ -3675,6 +3666,7 @@ impl Render for Composer {
         if let Some(preview) = self.preview.clone() {
             let weak = cx.weak_entity();
             return container.child(attachments::lightbox(
+                &theme,
                 window.viewport_size(),
                 &preview,
                 move |_, cx| {

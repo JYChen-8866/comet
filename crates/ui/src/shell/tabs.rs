@@ -277,11 +277,14 @@ impl Shell {
                     // close), so the wash snaps off it too — gpui allows only one
                     // `on_hover` per element, and the state listener wins.
                     let (text_color, bg) = if is_selected {
-                        (theme.text, crate::theme::glass_selected_bg())
+                        (theme.text, theme.element_active)
                     } else if is_hovered {
                         (theme.text_muted.opacity(0.8), theme.element_hover)
                     } else {
-                        (theme.text_muted.opacity(0.6), crate::theme::wash(0.0))
+                        (
+                            theme.text_muted.opacity(0.6),
+                            theme.element_hover.opacity(0.0),
+                        )
                     };
                     let glyph_alpha = if is_selected { 0.9 } else { 0.6 };
                     let brand = harness.map(crate::pickers::harness_brand_icon);
@@ -303,7 +306,7 @@ impl Shell {
                             .items_center()
                             .justify_center()
                             .rounded(px(6.0))
-                            .hover(|s| s.bg(crate::theme::wash(0.14)))
+                            .hover(|s| s.bg(theme.element_hover))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.close_session_tab(close_id.clone(), cx);
@@ -352,9 +355,7 @@ impl Shell {
                         .text_size(px(12.0))
                         .text_color(text_color)
                         .bg(bg)
-                        .when(is_selected, |el| {
-                            el.shadow(crate::theme::glass_selected_shadows())
-                        })
+                        .when(is_selected, |el| el.shadow(theme.selected_shadows()))
                         .cursor_pointer()
                         // Tabs sit inside the titlebar drag strip — carve them out.
                         // NOT `.occlude()`: a BlockMouse hitbox ends the hit test,
@@ -455,16 +456,16 @@ impl Shell {
             .rounded(px(8.0))
             .cursor_pointer()
             .bg(if on_canvas && has_space {
-                crate::theme::glass_selected_bg()
+                theme.element_active
             } else {
                 motion::hover_blend(
                     "session-tab-new",
-                    crate::theme::wash(0.0),
-                    crate::theme::wash(0.12),
+                    theme.element_hover.opacity(0.0),
+                    theme.element_hover,
                 )
             })
             .when(on_canvas && has_space, |el| {
-                el.shadow(crate::theme::glass_selected_shadows())
+                el.shadow(theme.selected_shadows())
             })
             .on_hover(motion::hover_listener("session-tab-new"))
             .occlude()
