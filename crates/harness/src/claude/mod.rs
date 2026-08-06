@@ -138,6 +138,10 @@ impl ClaudeHarness {
 
     fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
         let mut cmd = Command::new(exe);
+        #[cfg(windows)]
+        // Claude Code is a console executable; keep its stdio pipes without
+        // letting Windows allocate a separate console window for Comet.
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
         crate::prepend_exe_dir_to_path(&mut cmd, exe);
         cmd.args([
             "--print",
