@@ -8,14 +8,18 @@ use comet_ui::state::{AppState, ConnectionStatus, EngineBootConfig};
 use comet_ui::theme::Theme;
 use comet_ui::transcript::Transcript;
 use gpui::{
-    Anchor, AnyElement, App, Context, Entity, EventEmitter, Render, Subscription, Window, div,
-    prelude::*, px,
+    Anchor, AnyElement, App, Context, Entity, EventEmitter, Pixels, Render, Subscription, Window,
+    div, prelude::*, px,
 };
 
 static TOKIO_INIT: AtomicBool = AtomicBool::new(false);
 
 fn claim_tokio_initialization(flag: &AtomicBool) -> bool {
     !flag.swap(true, Ordering::AcqRel)
+}
+
+fn embedded_bottom_radius(radius: Pixels) -> Option<Pixels> {
+    (radius > px(0.0)).then_some(radius)
 }
 
 /// Install a host-owned Tokio runtime exactly once for every embedded Comet
@@ -52,6 +56,7 @@ pub struct ChatView {
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
     mention_popup: Option<Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>>,
+    embedded_bottom_radius: Option<Pixels>,
     initial_select_done: bool,
     initial_chat_id: Option<String>,
     _state_observation: Subscription,
@@ -111,6 +116,13 @@ impl ChatView {
         cx: &mut Context<Self>,
     ) {
         self.mention_popup = popup;
+        cx.notify();
+    }
+
+    /// Match the bottom corners of a host-owned embedded surface. Standalone
+    /// Comet views leave this unset and retain their full-window rectangle.
+    pub fn set_embedded_bottom_radius(&mut self, radius: Pixels, cx: &mut Context<Self>) {
+        self.embedded_bottom_radius = embedded_bottom_radius(radius);
         cx.notify();
     }
 
@@ -200,6 +212,7 @@ impl ChatView {
             transcript,
             composer,
             mention_popup: None,
+            embedded_bottom_radius: None,
             initial_select_done: false,
             initial_chat_id,
             _state_observation: state_observation,
@@ -241,6 +254,13 @@ mod tests {
         assert!(claim_tokio_initialization(&flag));
         assert!(!claim_tokio_initialization(&flag));
     }
+
+    #[test]
+    fn embedded_radius_ignores_non_positive_values() {
+        assert_eq!(embedded_bottom_radius(px(16.0)), Some(px(16.0)));
+        assert_eq!(embedded_bottom_radius(px(0.0)), None);
+        assert_eq!(embedded_bottom_radius(px(-1.0)), None);
+    }
 }
 
 impl Render for ChatView {
@@ -276,6 +296,9 @@ impl Render for ChatView {
             .id("comet-chat")
             .size_full()
             .bg(theme.bg)
+            .when_some(self.embedded_bottom_radius, |this, radius| {
+                this.rounded_b(radius)
+            })
             .text_color(theme.text)
             .flex()
             .flex_col()

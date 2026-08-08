@@ -2483,6 +2483,10 @@ impl Shell {
     }
 }
 
+fn shell_owns_root_surface(sidebar_only: bool) -> bool {
+    !sidebar_only
+}
+
 /// The sign-in gate's faint grid backdrop (comet styles.css `.bg-grid`):
 /// 44px hairlines at white 3.5%, with the radial mask approximated by edge
 /// gradients back into the page background (gpui has no mask-image).
@@ -2658,7 +2662,9 @@ impl Render for Shell {
             return div()
                 .id("comet-session-sidebar")
                 .size_full()
-                .bg(theme.surface)
+                .when(shell_owns_root_surface(self.sidebar_only), |this| {
+                    this.bg(theme.surface)
+                })
                 .child(sidebar);
         }
         // The shell tone (comet `.frost`): the surface the sidebar sits on and
@@ -2855,6 +2861,12 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn embedded_sidebar_leaves_surface_painting_to_its_host() {
+        assert!(!shell_owns_root_surface(true));
+        assert!(shell_owns_root_surface(false));
+    }
 
     #[test]
     fn embedded_chat_sidebar_fills_its_host_width() {
