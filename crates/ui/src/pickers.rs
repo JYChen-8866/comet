@@ -2578,7 +2578,8 @@ impl Render for Pickers {
             .flex()
             .flex_row()
             .items_center()
-            .flex_none()
+            .flex_1()
+            .min_w_0()
             .gap(px(4.0))
             // End-anchored: the menu's right edge sits flush with the chip's
             // right edge (user request), same as the footer's ref popover.

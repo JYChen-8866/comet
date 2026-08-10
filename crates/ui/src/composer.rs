@@ -62,6 +62,10 @@ pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BO
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
 /// Below this pill input width the composer always expands.
 pub const MIN_COMPACT_INPUT_WIDTH: f32 = 200.0;
+/// Compact controls keep a bounded share of the row. The picker summary is
+/// the only flexible item in this budget; attach/send remain visible.
+pub const COMPACT_ACTIONS_WIDTH: f32 = 288.0;
+pub const COMPACT_ACTIONS_MAX_FRACTION: f32 = 0.55;
 /// Input text metrics: `text-[14px] leading-relaxed` = 14 × 1.625 = 22.75.
 pub const INPUT_LINE_HEIGHT: f32 = 22.75;
 pub const INPUT_TEXT_SIZE: f32 = 14.0;
@@ -117,6 +121,34 @@ pub fn composer_flip(
         text_width >= capacity - COLLAPSE_HYSTERESIS
     } else {
         text_width > capacity
+    }
+}
+
+/// Resolve compact input capacity from the layout that actually produced the
+/// latest input measurement. New chats render expanded even while the stored
+/// mode is compact, so classifying by the stored mode can mistake the wide
+/// expanded textarea for compact capacity and overflow the first post-send
+/// frame in narrow embedded panels.
+pub fn compact_capacity_from_measurement(
+    measured_expanded: bool,
+    last_width: f32,
+    learned_compact_capacity: f32,
+    expanded_anchor: f32,
+) -> f32 {
+    if !measured_expanded {
+        return if last_width > 0.0 {
+            last_width - 8.0
+        } else {
+            f32::MAX
+        };
+    }
+    if learned_compact_capacity <= 0.0 {
+        return f32::MAX;
+    }
+    if expanded_anchor > 0.0 && last_width > 0.0 {
+        learned_compact_capacity + (last_width - expanded_anchor)
+    } else {
+        learned_compact_capacity
     }
 }
 
@@ -1941,6 +1973,12 @@ pub struct Composer {
     expanded_anchor: f32,
     /// Last input width seen in the current mode (resize detection).
     last_seen_width: f32,
+    /// Layout mode that produced the input measurement read on this frame.
+    /// This differs from `expanded_mode` while a new chat forces expanded UI.
+    last_layout_expanded: bool,
+    /// Mode of `last_seen_width`, so a compact/expanded width jump is not
+    /// mistaken for an interactive panel resize.
+    last_measured_expanded: Option<bool>,
     /// Set while an interactive resize is in flight; mode is frozen until
     /// widths have settled for [`RESIZE_SETTLE_MS`].
     width_changed_at: Option<Instant>,
@@ -2019,6 +2057,8 @@ impl Composer {
             compact_capacity: 0.0,
             expanded_anchor: 0.0,
             last_seen_width: 0.0,
+            last_layout_expanded: false,
+            last_measured_expanded: None,
             width_changed_at: None,
             settle_task: None,
             flip_morph: None,
@@ -3300,17 +3340,23 @@ impl Render for Composer {
             )
         };
         let now = Instant::now();
+        let measured_expanded = self.last_layout_expanded;
         // Only measurements taken *after* the last flip may drive the next one
         // (at most one flip per layout pass — a flip invalidates the widths).
         let measured_since_flip = epoch > self.flip_epoch && last_width > 0.0;
         if measured_since_flip {
+            if self.last_measured_expanded != Some(measured_expanded) {
+                self.last_seen_width = 0.0;
+                self.width_changed_at = None;
+                self.last_measured_expanded = Some(measured_expanded);
+            }
             // A same-mode width change is an interactive window/pane resize:
             // freeze the mode until sizes settle for RESIZE_SETTLE_MS.
             if self.last_seen_width > 0.0 && (last_width - self.last_seen_width).abs() > 0.5 {
                 self.width_changed_at = Some(now);
             }
             self.last_seen_width = last_width;
-            if self.expanded_mode {
+            if measured_expanded {
                 if self.expanded_anchor <= 0.0 {
                     self.expanded_anchor = last_width;
                 }
@@ -3339,21 +3385,12 @@ impl Render for Composer {
         // Layout-stable compact capacity: measured directly while compact;
         // while expanded, the learned value shifted by any container resize
         // (the expanded input width tracks the container 1:1).
-        let capacity = if !self.expanded_mode {
-            if last_width > 0.0 {
-                last_width - 8.0
-            } else {
-                f32::MAX // before first measure default to compact
-            }
-        } else if self.compact_capacity > 0.0 {
-            if self.expanded_anchor > 0.0 && last_width > 0.0 {
-                self.compact_capacity + (last_width - self.expanded_anchor)
-            } else {
-                self.compact_capacity
-            }
-        } else {
-            f32::MAX
-        };
+        let capacity = compact_capacity_from_measurement(
+            measured_expanded,
+            last_width,
+            self.compact_capacity,
+            self.expanded_anchor,
+        );
         let next = composer_flip(
             self.expanded_mode,
             text_width,
@@ -3456,6 +3493,14 @@ impl Render for Composer {
         // need the full-width actions row (comet composer-actions.tsx
         // `mustExpand = isNew || …`).
         let expanded = expanded || new_chat;
+        if expanded != self.last_layout_expanded {
+            // Consume one measurement from the layout we are about to draw.
+            // Without this frame, a new-chat -> existing-chat transition can
+            // remain stuck on the stale expanded width until unrelated state
+            // happens to repaint the composer.
+            self.last_layout_expanded = expanded;
+            window.request_animation_frame();
+        }
 
         // Committed-height morph: the layout below is already the NEW mode's;
         // only the pill's height (and the entrance fade/text glide driven by
@@ -3623,6 +3668,9 @@ impl Render for Composer {
                         )
                         .child(
                             div()
+                                .w(px(COMPACT_ACTIONS_WIDTH))
+                                .max_w(relative(COMPACT_ACTIONS_MAX_FRACTION))
+                                .min_w_0()
                                 .flex_none()
                                 .flex()
                                 .flex_row()
@@ -3636,7 +3684,7 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(div().flex_none().child(self.pickers.clone()))
+                                .child(div().flex_1().min_w_0().child(self.pickers.clone()))
                                 .child(attach)
                                 .child(send_button),
                         ),
@@ -3721,6 +3769,28 @@ mod tests {
         // Narrow column (< MIN_COMPACT_INPUT_WIDTH) always expands.
         assert!(composer_flip(false, 10.0, 199.0, false, false));
         assert!(!composer_flip(false, 10.0, 200.0, false, false));
+    }
+
+    #[test]
+    fn capacity_uses_the_layout_that_produced_the_measurement() {
+        // A narrow compact input must force the next render back to the
+        // two-row layout.
+        assert_eq!(
+            compact_capacity_from_measurement(false, 180.0, 0.0, 0.0),
+            172.0
+        );
+        // A new chat's expanded textarea is not compact capacity. Treating
+        // this 420px width as compact is the post-send sidebar overflow bug.
+        assert_eq!(
+            compact_capacity_from_measurement(true, 420.0, 0.0, 0.0),
+            f32::MAX
+        );
+        // Once compact capacity is known, expanded measurements only track
+        // real container-width deltas.
+        assert_eq!(
+            compact_capacity_from_measurement(true, 420.0, 240.0, 400.0),
+            260.0
+        );
     }
 
     #[test]
