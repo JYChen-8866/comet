@@ -9,7 +9,7 @@
 //! zero translate, applied after layout-relevant properties are fixed.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
@@ -36,6 +36,15 @@ pub const CODE_TEXT_SIZE: f32 = 12.5;
 pub const CODE_LINE_HEIGHT: f32 = 18.0;
 pub const CODE_PADDING_X: f32 = 12.0;
 pub const CODE_PADDING_Y: f32 = 10.0;
+
+// These caches are paint/layout accelerators, never document state. Bound them
+// at insertion time as well as during transcript sync: a user can visit an
+// unbounded number of historical rows by scrolling without causing another
+// state notification.
+const MAX_FLAT_CACHE_ENTRIES: usize = 512;
+const MAX_FLAT_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CODE_CACHE_ENTRIES: usize = 256;
+const MAX_CODE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 // Table metrics — a port of mugen-markdown 0.6.2's `TableBlock` under comet's
 // resolved md theme. The design is frameless ("flat hairline"): 1px horizontal
@@ -119,6 +128,18 @@ pub struct RenderCache {
     theme_key: Option<RenderThemeKey>,
     flats: HashMap<(SharedString, usize, usize), Rc<FlatText>>,
     code: HashMap<(SharedString, usize, usize), Rc<CachedCode>>,
+    flat_order: VecDeque<(SharedString, usize, usize)>,
+    code_order: VecDeque<(SharedString, usize, usize)>,
+    flat_bytes: usize,
+    code_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderCacheDiagnostics {
+    pub flat_entries: usize,
+    pub flat_bytes: usize,
+    pub code_entries: usize,
+    pub code_bytes: usize,
 }
 
 #[derive(Clone, PartialEq)]
@@ -150,7 +171,71 @@ pub struct CachedCode {
     lines: Vec<(SharedString, Vec<TextRun>)>,
 }
 
+fn text_run_heap_bytes(run: &TextRun) -> usize {
+    run.font.family.len()
+}
+
+fn flat_heap_bytes(flat: &FlatText) -> usize {
+    flat.text
+        .len()
+        .saturating_add(
+            flat.runs
+                .capacity()
+                .saturating_mul(std::mem::size_of::<TextRun>()),
+        )
+        .saturating_add(flat.runs.iter().map(text_run_heap_bytes).sum::<usize>())
+        .saturating_add(
+            flat.links
+                .capacity()
+                .saturating_mul(std::mem::size_of::<(Range<usize>, String)>()),
+        )
+        .saturating_add(
+            flat.links
+                .iter()
+                .map(|(_, url)| url.capacity())
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            flat.code_ranges
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Range<usize>>()),
+        )
+        .saturating_add(
+            flat.mention_ranges
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Range<usize>>()),
+        )
+}
+
+fn cached_code_heap_bytes(code: &CachedCode) -> usize {
+    code.lines
+        .capacity()
+        .saturating_mul(std::mem::size_of::<(SharedString, Vec<TextRun>)>())
+        .saturating_add(
+            code.lines
+                .iter()
+                .map(|(line, runs)| {
+                    line.len()
+                        .saturating_add(
+                            runs.capacity()
+                                .saturating_mul(std::mem::size_of::<TextRun>()),
+                        )
+                        .saturating_add(runs.iter().map(text_run_heap_bytes).sum::<usize>())
+                })
+                .sum::<usize>(),
+        )
+}
+
 impl RenderCache {
+    pub fn diagnostics(&self) -> RenderCacheDiagnostics {
+        RenderCacheDiagnostics {
+            flat_entries: self.flats.len(),
+            flat_bytes: self.flat_bytes,
+            code_entries: self.code.len(),
+            code_bytes: self.code_bytes,
+        }
+    }
+
     /// Drop shaped text runs when a live theme change affects their paint or fonts.
     pub fn sync_theme(&mut self, theme: &Theme) {
         let next = RenderThemeKey::new(theme);
@@ -163,13 +248,189 @@ impl RenderCache {
 
     /// Drop every cached entry for `row`.
     pub fn invalidate_row(&mut self, row: &str) {
-        self.flats.retain(|(r, _, _), _| r.as_ref() != row);
-        self.code.retain(|(r, _, _), _| r.as_ref() != row);
+        self.flats.retain(|key, value| {
+            if key.0.as_ref() == row {
+                self.flat_bytes = self.flat_bytes.saturating_sub(flat_heap_bytes(value));
+                false
+            } else {
+                true
+            }
+        });
+        self.code.retain(|key, value| {
+            if key.0.as_ref() == row {
+                self.code_bytes = self
+                    .code_bytes
+                    .saturating_sub(cached_code_heap_bytes(value));
+                false
+            } else {
+                true
+            }
+        });
+        self.flat_order.retain(|key| key.0.as_ref() != row);
+        self.code_order.retain(|key| key.0.as_ref() != row);
+    }
+
+    /// Keep render data only for the rows that are cheap to revisit. The list
+    /// virtualizer can ask for an evicted row again and the markdown tree will
+    /// rebuild it; retaining shaped runs for every historical row otherwise
+    /// makes a long chat grow without a bound.
+    pub fn retain_rows(&mut self, rows: &HashSet<SharedString>) {
+        self.flats.retain(|key, value| {
+            if rows.contains(&key.0) {
+                true
+            } else {
+                self.flat_bytes = self.flat_bytes.saturating_sub(flat_heap_bytes(value));
+                false
+            }
+        });
+        self.code.retain(|key, value| {
+            if rows.contains(&key.0) {
+                true
+            } else {
+                self.code_bytes = self
+                    .code_bytes
+                    .saturating_sub(cached_code_heap_bytes(value));
+                false
+            }
+        });
+        self.flat_order.retain(|key| self.flats.contains_key(key));
+        self.code_order.retain(|key| self.code.contains_key(key));
+        self.trim(None, None);
     }
 
     pub fn clear(&mut self) {
         self.flats.clear();
         self.code.clear();
+        self.flat_order.clear();
+        self.code_order.clear();
+        self.flat_bytes = 0;
+        self.code_bytes = 0;
+    }
+
+    fn touch_flat(&mut self, key: &(SharedString, usize, usize)) {
+        if let Some(ix) = self
+            .flat_order
+            .iter()
+            .position(|candidate| candidate == key)
+        {
+            self.flat_order.remove(ix);
+        }
+        self.flat_order.push_back(key.clone());
+    }
+
+    fn touch_code(&mut self, key: &(SharedString, usize, usize)) {
+        if let Some(ix) = self
+            .code_order
+            .iter()
+            .position(|candidate| candidate == key)
+        {
+            self.code_order.remove(ix);
+        }
+        self.code_order.push_back(key.clone());
+    }
+
+    fn trim(
+        &mut self,
+        preserve_flat: Option<&(SharedString, usize, usize)>,
+        preserve_code: Option<&(SharedString, usize, usize)>,
+    ) {
+        self.flat_order.retain(|key| self.flats.contains_key(key));
+        while self.flats.len() > MAX_FLAT_CACHE_ENTRIES || self.flat_bytes > MAX_FLAT_CACHE_BYTES {
+            let Some(key) = self.flat_order.pop_front() else {
+                break;
+            };
+            if preserve_flat == Some(&key) {
+                self.flat_order.push_back(key);
+                if self
+                    .flat_order
+                    .iter()
+                    .all(|candidate| preserve_flat == Some(candidate))
+                {
+                    break;
+                }
+                continue;
+            }
+            if let Some(value) = self.flats.remove(&key) {
+                self.flat_bytes = self.flat_bytes.saturating_sub(flat_heap_bytes(&value));
+            }
+        }
+        self.code_order.retain(|key| self.code.contains_key(key));
+        while self.code.len() > MAX_CODE_CACHE_ENTRIES || self.code_bytes > MAX_CODE_CACHE_BYTES {
+            let Some(key) = self.code_order.pop_front() else {
+                break;
+            };
+            if preserve_code == Some(&key) {
+                self.code_order.push_back(key);
+                if self
+                    .code_order
+                    .iter()
+                    .all(|candidate| preserve_code == Some(candidate))
+                {
+                    break;
+                }
+                continue;
+            }
+            if let Some(value) = self.code.remove(&key) {
+                self.code_bytes = self
+                    .code_bytes
+                    .saturating_sub(cached_code_heap_bytes(&value));
+            }
+        }
+    }
+
+    fn get_or_insert_flat(
+        &mut self,
+        key: (SharedString, usize, usize),
+        build: impl FnOnce() -> Rc<FlatText>,
+    ) -> Rc<FlatText> {
+        if let Some(value) = self.flats.get(&key).cloned() {
+            self.touch_flat(&key);
+            return value;
+        }
+        let value = build();
+        let value_bytes = flat_heap_bytes(&value);
+        // The caller owns `value` for this paint. An individual object larger
+        // than the whole cache budget must remain a one-frame cold value rather
+        // than forcing the cache above its advertised hard boundary.
+        if value_bytes > MAX_FLAT_CACHE_BYTES || MAX_FLAT_CACHE_ENTRIES == 0 {
+            return value;
+        }
+        self.flat_bytes = self.flat_bytes.saturating_add(value_bytes);
+        self.flats.insert(key.clone(), value.clone());
+        self.touch_flat(&key);
+        self.trim(Some(&key), None);
+        value
+    }
+
+    fn get_or_insert_code(
+        &mut self,
+        key: (SharedString, usize, usize),
+        code_len: usize,
+        hl_key: (usize, usize),
+        build: impl FnOnce() -> Rc<CachedCode>,
+    ) -> Rc<CachedCode> {
+        if let Some(value) = self.code.get(&key).cloned()
+            && value.code_len == code_len
+            && value.hl_key == hl_key
+        {
+            self.touch_code(&key);
+            return value;
+        }
+        if let Some(previous) = self.code.remove(&key) {
+            self.code_bytes = self
+                .code_bytes
+                .saturating_sub(cached_code_heap_bytes(&previous));
+        }
+        let value = build();
+        let value_bytes = cached_code_heap_bytes(&value);
+        if value_bytes > MAX_CODE_CACHE_BYTES || MAX_CODE_CACHE_ENTRIES == 0 {
+            return value;
+        }
+        self.code_bytes = self.code_bytes.saturating_add(value_bytes);
+        self.code.insert(key.clone(), value.clone());
+        self.touch_code(&key);
+        self.trim(None, Some(&key));
+        value
     }
 }
 
@@ -662,10 +923,9 @@ fn flatten_cached(
     match &opts.cache {
         Some(cache) => cache
             .borrow_mut()
-            .flats
-            .entry((opts.row_key.clone(), top_ix, ix))
-            .or_insert_with(|| Rc::new(flatten_runs_weighted(runs, theme, base_weight)))
-            .clone(),
+            .get_or_insert_flat((opts.row_key.clone(), top_ix, ix), || {
+                Rc::new(flatten_runs_weighted(runs, theme, base_weight))
+            }),
         None => Rc::new(flatten_runs_weighted(runs, theme, base_weight)),
     }
 }
@@ -1033,17 +1293,12 @@ fn render_code_block(
         })
     };
     let cached: Rc<CachedCode> = match &opts.cache {
-        Some(cache) => {
-            let mut cache = cache.borrow_mut();
-            let entry = cache
-                .code
-                .entry((opts.row_key.clone(), top_ix, ix))
-                .or_insert_with(&build);
-            if entry.code_len != code.len() || entry.hl_key != hl_key {
-                *entry = build();
-            }
-            entry.clone()
-        }
+        Some(cache) => cache.borrow_mut().get_or_insert_code(
+            (opts.row_key.clone(), top_ix, ix),
+            code.len(),
+            hl_key,
+            build,
+        ),
         None => build(),
     };
     // Streaming veil over appended code, tracked on the whole code text and
@@ -1253,10 +1508,9 @@ mod tests {
             text: "cached model output".into(),
             style: InlineStyle::default(),
         }];
-        cache.flats.insert(
-            ("row".into(), 0, 0),
-            std::rc::Rc::new(flatten_runs(&runs, &theme, false)),
-        );
+        cache.get_or_insert_flat(("row".into(), 0, 0), || {
+            std::rc::Rc::new(flatten_runs(&runs, &theme, false))
+        });
 
         cache.sync_theme(&theme);
         assert_eq!(cache.flats.len(), 1);
@@ -1269,6 +1523,113 @@ mod tests {
         next_theme.text = gpui::hsla(0.0, 0.0, 0.1, 1.0);
         cache.sync_theme(&next_theme);
         assert!(cache.flats.is_empty());
+        assert_eq!(cache.flat_bytes, 0);
+        assert!(cache.flat_order.is_empty());
+    }
+
+    #[test]
+    fn render_cache_stays_bounded_while_scrolling_without_sync() {
+        let theme = Theme::dark();
+        let runs = [InlineRun {
+            text: "historical row".into(),
+            style: InlineStyle::default(),
+        }];
+        let mut cache = RenderCache::default();
+
+        // Model a long static transcript being scrolled without any AppState
+        // notification: insertion itself, not `retain_rows`, must evict LRU.
+        for ix in 0..(MAX_FLAT_CACHE_ENTRIES + 64) {
+            cache.get_or_insert_flat((format!("flat-{ix}").into(), 0, 0), || {
+                Rc::new(flatten_runs(&runs, &theme, false))
+            });
+        }
+        assert!(cache.flats.len() <= MAX_FLAT_CACHE_ENTRIES);
+        assert_eq!(cache.flat_order.len(), cache.flats.len());
+        assert!(cache.flat_bytes <= MAX_FLAT_CACHE_BYTES);
+
+        let large_text = "x".repeat(MAX_FLAT_CACHE_BYTES / 2 + 1024);
+        let large_runs = [InlineRun {
+            text: large_text,
+            style: InlineStyle::default(),
+        }];
+        for ix in 0..3 {
+            cache.get_or_insert_flat((format!("large-flat-{ix}").into(), 0, 0), || {
+                Rc::new(flatten_runs(&large_runs, &theme, false))
+            });
+        }
+        assert!(cache.flat_bytes <= MAX_FLAT_CACHE_BYTES);
+
+        let mono = font(theme.font_mono.clone());
+        for ix in 0..(MAX_CODE_CACHE_ENTRIES + 64) {
+            cache.get_or_insert_code((format!("code-{ix}").into(), 0, 0), 1, (0, 0), || {
+                Rc::new(CachedCode {
+                    code_len: 1,
+                    hl_key: (0, 0),
+                    lines: vec![(
+                        "x".into(),
+                        vec![TextRun {
+                            len: 1,
+                            font: mono.clone(),
+                            color: theme.text,
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        }],
+                    )],
+                })
+            });
+        }
+        assert!(cache.code.len() <= MAX_CODE_CACHE_ENTRIES);
+        assert_eq!(cache.code_order.len(), cache.code.len());
+        assert!(cache.code_bytes <= MAX_CODE_CACHE_BYTES);
+
+        let large_line = "x".repeat(MAX_CODE_CACHE_BYTES / 2 + 1024);
+        for ix in 0..3 {
+            cache.get_or_insert_code(
+                (format!("large-code-{ix}").into(), 0, 0),
+                large_line.len(),
+                (0, 0),
+                || {
+                    Rc::new(CachedCode {
+                        code_len: large_line.len(),
+                        hl_key: (0, 0),
+                        lines: vec![(large_line.clone().into(), Vec::new())],
+                    })
+                },
+            );
+        }
+        assert!(cache.code_bytes <= MAX_CODE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn render_cache_never_retains_one_object_larger_than_its_budget() {
+        let theme = Theme::dark();
+        let oversized = "x".repeat(MAX_FLAT_CACHE_BYTES + 1);
+        let runs = [InlineRun {
+            text: oversized.clone(),
+            style: InlineStyle::default(),
+        }];
+        let mut cache = RenderCache::default();
+        let flat = cache.get_or_insert_flat(("oversized-flat".into(), 0, 0), || {
+            Rc::new(flatten_runs(&runs, &theme, false))
+        });
+        assert_eq!(flat.text.len(), oversized.len());
+        assert_eq!(cache.diagnostics(), RenderCacheDiagnostics::default());
+
+        let code = cache.get_or_insert_code(
+            ("oversized-code".into(), 0, 0),
+            oversized.len(),
+            (0, 0),
+            || {
+                Rc::new(CachedCode {
+                    code_len: oversized.len(),
+                    hl_key: (0, 0),
+                    lines: vec![(oversized.into(), Vec::new())],
+                })
+            },
+        );
+        assert!(code.lines[0].0.len() > MAX_CODE_CACHE_BYTES);
+        assert_eq!(cache.diagnostics(), RenderCacheDiagnostics::default());
     }
 
     #[test]

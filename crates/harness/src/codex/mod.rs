@@ -368,6 +368,14 @@ async fn send(tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>, ev: AgentEven
     tx.send(Ok(ev)).await.is_ok()
 }
 
+fn can_receive_steer(
+    steering_open: bool,
+    interrupted: bool,
+    pending_steer: &Option<String>,
+) -> bool {
+    steering_open && !interrupted && pending_steer.is_none()
+}
+
 /// `turn/start` and return the new turn id from the response.
 async fn start_turn(client: &RpcClient, params: Value) -> Result<String, HarnessError> {
     let started = client.request("turn/start", params).await?;
@@ -442,7 +450,7 @@ async fn run_session(session: Session) {
                 }),
             )
             .await?;
-        client.notify("initialized", None);
+        client.notify("initialized", None).await?;
 
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
@@ -565,9 +573,12 @@ async fn run_session(session: Session) {
     let mut streamed_text: HashSet<String> = HashSet::new();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
-    // Steers whose `turn/steer` lost the turn-completed race; delivered as the
+    // A steer whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
-    let mut queued_steers: VecDeque<String> = VecDeque::new();
+    // While occupied, stop polling the mailbox so subsequent steers remain in
+    // its bounded channel instead of being drained into an unbounded local
+    // queue during a stalled turn.
+    let mut pending_steer: Option<String> = None;
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -684,7 +695,7 @@ async fn run_session(session: Session) {
                         // Persistent session: a steer that lost the race with
                         // this turn's end becomes the next turn now; otherwise
                         // stay alive for the mailbox — the caller owns teardown.
-                        if let Some(text) = queued_steers.pop_front() {
+                        if let Some(text) = pending_steer.take() {
                             if !steer_as_new_turn(
                                 &client,
                                 turn_params(&text),
@@ -776,14 +787,14 @@ async fn run_session(session: Session) {
                         &params,
                         request.auto_approve,
                         &request_input,
-                    );
+                    ).await;
                 }
 
                 // stdout EOF or reader gone: the app server exited.
                 Some(Incoming::Eof) | None => break 'main,
             },
 
-            steer = steering.recv(), if steering_open && !interrupted => match steer {
+            steer = steering.recv(), if can_receive_steer(steering_open, interrupted, &pending_steer) => match steer {
                 Some(msg) => {
                     let text = msg.prompt;
                     if let Some(expected) = router.active.clone() {
@@ -821,7 +832,8 @@ async fn run_session(session: Session) {
                                 if router.active.as_deref() == Some(expected.as_str())
                                     && !router.is_completed(&expected)
                                 {
-                                    queued_steers.push_back(text);
+                                    debug_assert!(pending_steer.is_none());
+                                    pending_steer = Some(text);
                                 } else if !steer_as_new_turn(
                                     &client,
                                     turn_params(&text),
@@ -854,7 +866,7 @@ async fn run_session(session: Session) {
                     // once nothing is in flight — mirrors codex.ts's steer loop
                     // `finish()` on a null take.
                     steering_open = false;
-                    if router.active.is_none() && queued_steers.is_empty() {
+                    if router.active.is_none() && pending_steer.is_none() {
                         break 'main;
                     }
                 }
@@ -989,7 +1001,7 @@ type RequestInputFn = Box<
 /// message loop keeps flowing); with `auto_approve` they're accepted outright
 /// (belt to the wire-level `approvalPolicy: "never"`). Anything else is
 /// rejected as unsupported so the server never wedges awaiting a reply.
-fn handle_server_request(
+async fn handle_server_request(
     client: &RpcClient,
     id: Value,
     method: &str,
@@ -1006,11 +1018,13 @@ fn handle_server_request(
             target: "comet_harness::codex",
             "unhandled server request: {method}"
         );
-        client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
+        let _ = client
+            .respond_error(&id, -32601, &format!("unsupported method: {method}"))
+            .await;
         return;
     }
     if auto_approve {
-        client.respond(&id, json!({ "decision": "accept" }));
+        let _ = client.respond(&id, json!({ "decision": "accept" })).await;
         return;
     }
 
@@ -1031,10 +1045,12 @@ fn handle_server_request(
         let accept = answers.iter().any(|a| {
             a.question_id == question.id && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
         });
-        client.respond(
-            &id,
-            json!({ "decision": if accept { "accept" } else { "decline" } }),
-        );
+        let _ = client
+            .respond(
+                &id,
+                json!({ "decision": if accept { "accept" } else { "decline" } }),
+            )
+            .await;
     });
 }
 
@@ -1210,5 +1226,13 @@ mod tests {
         r.note_started("t-3".into());
         assert_eq!(r.active.as_deref(), Some("t-3"));
         assert!(r.is_completed("t-2"));
+    }
+
+    #[test]
+    fn pending_steer_applies_backpressure_to_the_bounded_mailbox() {
+        assert!(can_receive_steer(true, false, &None));
+        assert!(!can_receive_steer(true, false, &Some("later".into())));
+        assert!(!can_receive_steer(false, false, &None));
+        assert!(!can_receive_steer(true, true, &None));
     }
 }

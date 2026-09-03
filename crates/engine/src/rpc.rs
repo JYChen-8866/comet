@@ -243,6 +243,31 @@ where
     .boxed()
 }
 
+/// A document watch must keep its `ChatDocHandle` alive for as long as the RPC
+/// stream is subscribed. `DocHost` deliberately stores only a weak registry;
+/// carrying the strong owner in the unfold state gives the stream the same
+/// lifetime semantics without pinning every chat forever.
+fn watch_stream_owned<T, O>(
+    rx: watch::Receiver<T>,
+    owner: O,
+) -> BoxStream<'static, serde_json::Value>
+where
+    T: serde::Serialize + Clone + Send + Sync + 'static,
+    O: Send + 'static,
+{
+    futures::stream::unfold((rx, false, owner), |(mut rx, emitted, owner)| async move {
+        if emitted {
+            rx.changed().await.ok()?;
+        }
+        let value = {
+            let borrowed = rx.borrow_and_update();
+            serde_json::to_value(&*borrowed).ok()?
+        };
+        Some((value, (rx, true, owner)))
+    })
+    .boxed()
+}
+
 #[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
@@ -274,7 +299,10 @@ impl RpcService for EngineRpc {
                     .doc_host
                     .open(&p.chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                Ok(RpcReply::Stream(watch_stream(handle.watch_messages())))
+                Ok(RpcReply::Stream(watch_stream_owned(
+                    handle.watch_messages(),
+                    handle,
+                )))
             }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
@@ -369,5 +397,33 @@ fn list_folders(path: Option<String>) -> comet_proto::FolderListing {
         path,
         entries,
         truncated,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct DropProbe(Arc<AtomicUsize>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_watch_releases_document_owner_when_rpc_stream_closes() {
+        let (tx, rx) = watch::channel(vec!["initial"]);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut stream = watch_stream_owned(rx, DropProbe(drops.clone()));
+
+        assert_eq!(stream.next().await.unwrap(), serde_json::json!(["initial"]));
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        drop(stream);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        drop(tx);
     }
 }

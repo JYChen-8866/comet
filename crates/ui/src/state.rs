@@ -17,7 +17,7 @@
 //! Pure logic (sort order, staleness, gate phase) lives in free functions with
 //! unit tests; rendering reads them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -219,6 +219,21 @@ pub use comet_proto::view::{
     project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
 };
 
+/// Optimistic echoes are a UI convenience, not the source of truth. Bound both
+/// count and text bytes so a disconnected client cannot retain an arbitrary
+/// number of pasted prompts while waiting for the engine watch.
+const MAX_TOTAL_ECHOES: usize = 64;
+const MAX_ECHO_ENTRY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ECHO_BYTES: usize = 16 * 1024 * 1024;
+
+fn message_entry_bytes(entry: &SessionMessageEntry) -> usize {
+    entry
+        .id
+        .len()
+        .saturating_add(entry.device_id.len())
+        .saturating_add(entry.parts.iter().map(MessagePart::byte_len).sum::<usize>())
+}
+
 // ---------------------------------------------------------------------------
 // AppState entity
 // ---------------------------------------------------------------------------
@@ -245,6 +260,9 @@ pub struct AppState {
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
+    /// FIFO admission order for the bounded optimistic-echo store. Failed or
+    /// offline sends must not pin one message per chat for the process lifetime.
+    echo_order: VecDeque<(String, String)>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -274,6 +292,7 @@ impl AppState {
             selected_chat: None,
             transcript: Arc::from([]),
             echoes: HashMap::new(),
+            echo_order: VecDeque::new(),
             local_device_id: None,
             data_dir: None,
             engine: None,
@@ -288,6 +307,14 @@ impl AppState {
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
+        let live_chat_ids = self
+            .chats
+            .iter()
+            .map(|chat| chat.id.as_str())
+            .collect::<HashSet<_>>();
+        self.echoes
+            .retain(|chat_id, _| live_chat_ids.contains(chat_id.as_str()));
+        self.prune_echo_order();
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
         {
@@ -365,14 +392,25 @@ impl AppState {
         {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
+        self.echoes.retain(|_, echoes| !echoes.is_empty());
+        self.prune_echo_order();
         self.transcript = entries.into();
     }
 
     /// Add an optimistic user echo (composer send path).
     pub fn push_echo(&mut self, chat_id: &str, entry: SessionMessageEntry) {
+        if message_entry_bytes(&entry) > MAX_ECHO_ENTRY_BYTES {
+            // The durable command still owns this message; omitting an
+            // oversized optimistic copy prevents a paste from being held a
+            // second time merely for the instant before the doc watch lands.
+            return;
+        }
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
+            let message_id = entry.id.clone();
             echoes.push(entry);
+            self.echo_order.push_back((chat_id.to_owned(), message_id));
+            self.trim_echoes();
         }
     }
 
@@ -381,6 +419,8 @@ impl AppState {
         if let Some(echoes) = self.echoes.get_mut(chat_id) {
             echoes.retain(|e| e.id != message_id);
         }
+        self.echoes.retain(|_, echoes| !echoes.is_empty());
+        self.prune_echo_order();
     }
 
     /// Unconfirmed echoes for the selected chat, in send order.
@@ -390,6 +430,35 @@ impl AppState {
             .and_then(|id| self.echoes.get(id))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    fn prune_echo_order(&mut self) {
+        self.echo_order.retain(|(chat_id, message_id)| {
+            self.echoes
+                .get(chat_id)
+                .is_some_and(|echoes| echoes.iter().any(|echo| echo.id == *message_id))
+        });
+    }
+
+    fn trim_echoes(&mut self) {
+        self.prune_echo_order();
+        while self.echo_order.len() > MAX_TOTAL_ECHOES || self.total_echo_bytes() > MAX_ECHO_BYTES {
+            let Some((chat_id, message_id)) = self.echo_order.pop_front() else {
+                break;
+            };
+            if let Some(echoes) = self.echoes.get_mut(&chat_id) {
+                echoes.retain(|echo| echo.id != message_id);
+            }
+        }
+        self.echoes.retain(|_, echoes| !echoes.is_empty());
+    }
+
+    fn total_echo_bytes(&self) -> usize {
+        self.echoes
+            .values()
+            .flat_map(|echoes| echoes.iter())
+            .map(message_entry_bytes)
+            .sum()
     }
 
     // ---- queries ----
@@ -632,7 +701,7 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
     cx.spawn(async move |this, cx| {
         let mut rx = match handle
             .client()
-            .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
+            .subscribe_latest(methods::WATCH_CHATS, serde_json::json!({}))
             .await
         {
             Ok(rx) => rx,
@@ -680,7 +749,7 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     cx.spawn(async move |this, cx| {
         let mut rx = match handle
             .client()
-            .subscribe(method, serde_json::json!({}))
+            .subscribe_latest(method, serde_json::json!({}))
             .await
         {
             Ok(rx) => rx,
@@ -744,7 +813,7 @@ fn spawn_transcript_watch(
         let params = serde_json::json!({ "chatId": chat_id });
         let mut rx = match handle
             .client()
-            .subscribe(methods::WATCH_DOC_MESSAGES, params)
+            .subscribe_latest(methods::WATCH_DOC_MESSAGES, params)
             .await
         {
             Ok(rx) => rx,
@@ -1270,6 +1339,33 @@ mod tests {
             },
         );
         assert!(state.pending_echoes().is_empty());
+    }
+
+    #[test]
+    fn optimistic_echoes_are_bounded_and_oldest_are_evicted() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        for index in 0..(MAX_TOTAL_ECHOES + 8) {
+            state.push_echo(
+                "c1",
+                SessionMessageEntry {
+                    id: format!("m{index}"),
+                    role: comet_doc::MessageRole::User,
+                    parts: vec![MessagePart::Text {
+                        id: "t".into(),
+                        text: "prompt".into(),
+                    }],
+                    created_at: index as i64,
+                    device_id: "local".into(),
+                    status: None,
+                    continuation_of: None,
+                },
+            );
+        }
+        assert_eq!(state.pending_echoes().len(), MAX_TOTAL_ECHOES);
+        assert_eq!(state.pending_echoes().first().unwrap().id, "m8");
+        assert_eq!(state.pending_echoes().last().unwrap().id, "m71");
+        assert!(state.total_echo_bytes() <= MAX_ECHO_BYTES);
     }
 
     fn chat_with_cwd(id: &str, created_min: i64, cwd: Option<&str>) -> Chat {

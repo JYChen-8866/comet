@@ -71,7 +71,7 @@ impl MessagePart {
     }
 }
 
-/// Immutably fold one agent event into a parts accumulator.
+/// Fold one agent event into a parts accumulator in place.
 ///
 /// Semantics from comet `foldEventIntoParts`:
 /// - `SessionStarted` / `Steered` reset the accumulator (turn boundary — makes replay safe).
@@ -81,18 +81,22 @@ impl MessagePart {
 /// - `ToolResult` marks the matching tool part resolved / errored in place.
 /// - `InputRequested` appends an input part; `InputResolved` marks it resolved.
 /// - `Error` and `Done{error}` become visible error parts.
-pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<MessagePart> {
-    let mut out: Vec<MessagePart> = parts.to_vec();
+///
+/// The streaming engine must use this form. A model commonly emits one event
+/// per token; cloning the accumulated parts on every event makes a reply use
+/// quadratic copy bandwidth and briefly keeps two copies of all text alive.
+pub fn fold_event_into_parts_in_place(parts: &mut Vec<MessagePart>, event: &AgentEvent) {
     match event {
         AgentEvent::SessionStarted { .. } | AgentEvent::Steered { .. } => {
-            return Vec::new();
+            parts.clear();
+            return;
         }
         AgentEvent::TextDelta { text } => {
-            if let Some(MessagePart::Text { text: tail, .. }) = out.last_mut() {
+            if let Some(MessagePart::Text { text: tail, .. }) = parts.last_mut() {
                 tail.push_str(text);
             } else {
-                let id = format!("t{}", out.len());
-                out.push(MessagePart::Text {
+                let id = format!("t{}", parts.len());
+                parts.push(MessagePart::Text {
                     id,
                     text: text.clone(),
                 });
@@ -102,7 +106,7 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
             // Reasoning is not rendered as a transcript part (matches comet).
         }
         AgentEvent::ToolCall { id, call } => {
-            if let Some(existing) = out.iter_mut().find_map(|p| match p {
+            if let Some(existing) = parts.iter_mut().find_map(|p| match p {
                 MessagePart::Tool {
                     id: pid, call: c, ..
                 } if pid == id => Some(c),
@@ -110,7 +114,7 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
             }) {
                 *existing = call.clone();
             } else {
-                out.push(MessagePart::Tool {
+                parts.push(MessagePart::Tool {
                     id: id.clone(),
                     call: call.clone(),
                     is_error: false,
@@ -119,7 +123,7 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
             }
         }
         AgentEvent::ToolResult { id, is_error } => {
-            for p in out.iter_mut() {
+            for p in parts.iter_mut() {
                 if let MessagePart::Tool {
                     id: pid,
                     is_error: e,
@@ -138,8 +142,8 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
             questions,
         } => {
             let id = format!("in-{request_id}");
-            if !out.iter().any(|p| p.id() == id) {
-                out.push(MessagePart::Input {
+            if !parts.iter().any(|p| p.id() == id) {
+                parts.push(MessagePart::Input {
                     id,
                     request_id: request_id.clone(),
                     questions: questions.clone(),
@@ -148,7 +152,7 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
             }
         }
         AgentEvent::InputResolved { request_id } => {
-            for p in out.iter_mut() {
+            for p in parts.iter_mut() {
                 if let MessagePart::Input {
                     request_id: rid,
                     resolved,
@@ -161,16 +165,16 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
             }
         }
         AgentEvent::Error { message } => {
-            let id = format!("e{}", out.len());
-            out.push(MessagePart::Error {
+            let id = format!("e{}", parts.len());
+            parts.push(MessagePart::Error {
                 id,
                 message: message.clone(),
             });
         }
         AgentEvent::Done { error, .. } => {
             if let Some(message) = error {
-                let id = format!("e{}", out.len());
-                out.push(MessagePart::Error {
+                let id = format!("e{}", parts.len());
+                parts.push(MessagePart::Error {
                     id,
                     message: message.clone(),
                 });
@@ -178,6 +182,13 @@ pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<M
         }
         AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::Usage { .. } => {}
     }
+}
+
+/// Immutable convenience wrapper retained for callers that need value-style
+/// folding. Streaming paths should call [`fold_event_into_parts_in_place`].
+pub fn fold_event_into_parts(parts: &[MessagePart], event: &AgentEvent) -> Vec<MessagePart> {
+    let mut out = parts.to_vec();
+    fold_event_into_parts_in_place(&mut out, event);
     out
 }
 
@@ -306,6 +317,42 @@ mod tests {
             MessagePart::Text { text, .. } => assert_eq!(text, "after"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn in_place_fold_does_not_clone_settled_parts() {
+        let mut parts = vec![MessagePart::Text {
+            id: "settled".into(),
+            text: String::from("settled prefix"),
+        }];
+        fold_event_into_parts_in_place(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "tool".into(),
+                call: ToolCall::Exec {
+                    command: "true".into(),
+                },
+            },
+        );
+        fold_event_into_parts_in_place(&mut parts, &text_delta("live"));
+
+        let settled_ptr = match &parts[0] {
+            MessagePart::Text { text, .. } => text.as_ptr(),
+            _ => unreachable!(),
+        };
+        fold_event_into_parts_in_place(&mut parts, &text_delta(" tail"));
+
+        match &parts[0] {
+            MessagePart::Text { text, .. } => {
+                assert_eq!(text, "settled prefix");
+                assert_eq!(text.as_ptr(), settled_ptr);
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            &parts[2],
+            MessagePart::Text { text, .. } if text == "live tail"
+        ));
     }
 
     #[test]

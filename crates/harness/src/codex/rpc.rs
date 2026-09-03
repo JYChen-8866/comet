@@ -39,19 +39,31 @@ pub(crate) enum Incoming {
 }
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
+const WRITER_QUEUE_CAPACITY: usize = 32;
+
+struct PendingRequestGuard {
+    id: i64,
+    pending: Pending,
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        self.pending.lock().expect("pending lock").remove(&self.id);
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct RpcClient {
     next_id: Arc<AtomicI64>,
     pending: Pending,
-    writer: mpsc::UnboundedSender<String>,
+    writer: mpsc::Sender<String>,
 }
 
 impl RpcClient {
     /// Spawn the writer + reader tasks over the child's stdio; returns the
     /// client and the incoming (notification/request) channel.
     pub fn new(stdin: ChildStdin, stdout: ChildStdout) -> (Self, mpsc::Receiver<Incoming>) {
-        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<String>();
+        let (writer_tx, writer_rx) = mpsc::channel::<String>(WRITER_QUEUE_CAPACITY);
         tokio::spawn(write_loop(stdin, writer_rx));
         let pending: Pending = Arc::default();
         let (incoming_tx, incoming_rx) = mpsc::channel(256);
@@ -71,52 +83,73 @@ impl RpcClient {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (tx, rx) = oneshot::channel();
         self.pending.lock().expect("pending lock").insert(id, tx);
+        // Cancellation of this future must not leave its sender and request id
+        // resident until the child eventually replies (or exits).
+        let guard = PendingRequestGuard {
+            id,
+            pending: Arc::clone(&self.pending),
+        };
         let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        if self.writer.send(line.to_string()).is_err() {
-            self.pending.lock().expect("pending lock").remove(&id);
+        if self.writer.send(line.to_string()).await.is_err() {
             return Err(HarnessError::Protocol(format!(
                 "{method}: app-server stdin closed"
             )));
         }
-        match rx.await {
+        let result = match rx.await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(message)) => Err(HarnessError::Protocol(format!("{method}: {message}"))),
             // Sender dropped: the reader hit EOF and failed all pending.
             Err(_) => Err(HarnessError::Protocol(format!(
                 "{method}: app-server exited before responding"
             ))),
-        }
+        };
+        drop(guard);
+        result
     }
 
     /// Fire a notification (no id, no response).
-    pub fn notify(&self, method: &str, params: Option<Value>) {
+    pub async fn notify(&self, method: &str, params: Option<Value>) -> Result<(), HarnessError> {
         let line = match params {
             Some(params) => json!({ "jsonrpc": "2.0", "method": method, "params": params }),
             None => json!({ "jsonrpc": "2.0", "method": method }),
         };
-        let _ = self.writer.send(line.to_string());
+        self.writer
+            .send(line.to_string())
+            .await
+            .map_err(|_| HarnessError::Protocol(format!("{method}: app-server stdin closed")))
     }
 
     /// Answer a server→client request.
-    pub fn respond(&self, id: &Value, result: Value) {
+    pub async fn respond(&self, id: &Value, result: Value) -> Result<(), HarnessError> {
         let line = json!({ "jsonrpc": "2.0", "id": id, "result": result });
-        let _ = self.writer.send(line.to_string());
+        self.writer
+            .send(line.to_string())
+            .await
+            .map_err(|_| HarnessError::Protocol("app-server stdin closed".into()))
     }
 
     /// Reject a server→client request (e.g. unknown method).
-    pub fn respond_error(&self, id: &Value, code: i64, message: &str) {
+    pub async fn respond_error(
+        &self,
+        id: &Value,
+        code: i64,
+        message: &str,
+    ) -> Result<(), HarnessError> {
         let line = json!({
             "jsonrpc": "2.0",
             "id": id,
             "error": { "code": code, "message": message },
         });
-        let _ = self.writer.send(line.to_string());
+        self.writer
+            .send(line.to_string())
+            .await
+            .map_err(|_| HarnessError::Protocol("app-server stdin closed".into()))
     }
 }
 
 /// Owns the child's stdin; a write failure (EPIPE after the child died) is
 /// tolerated and logged.
-async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<String>) {
+async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::Receiver<String>) {
     while let Some(line) = rx.recv().await {
         let write = async {
             stdin.write_all(line.as_bytes()).await?;
@@ -192,4 +225,23 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
     // EOF/read error: fail every awaiting request, then signal the loop.
     pending.lock().expect("pending lock").clear();
     let _ = tx.send(Incoming::Eof).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_request_guard_removes_pending_sender() {
+        let pending: Pending = Arc::default();
+        let (sender, _receiver) = oneshot::channel();
+        pending.lock().unwrap().insert(7, sender);
+
+        drop(PendingRequestGuard {
+            id: 7,
+            pending: Arc::clone(&pending),
+        });
+
+        assert!(pending.lock().unwrap().is_empty());
+    }
 }

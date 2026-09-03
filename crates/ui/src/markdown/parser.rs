@@ -12,6 +12,7 @@
 //! through both paths and assert equality.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
@@ -87,7 +88,11 @@ pub struct TopBlock {
 /// The parse result: top-level blocks in document order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BlockTree {
-    pub blocks: Vec<TopBlock>,
+    /// Top-level blocks are immutable and structurally shared. Incremental
+    /// parses replace only the unstable tail; display/canonical trees share
+    /// every settled block instead of deep-cloning its text/table/code data on
+    /// each streamed token batch.
+    pub blocks: Vec<Arc<TopBlock>>,
 }
 
 impl BlockTree {
@@ -97,6 +102,105 @@ impl BlockTree {
 
     pub fn len(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Heap bytes owned by this parsed tree (excluding the stack-sized root).
+    ///
+    /// Transcript markdown trees are recomputable caches. Their eviction budget
+    /// must account for the owned run/code/link strings and nested collection
+    /// backing stores rather than using source length as a proxy: tables and
+    /// heavily styled text can have substantially more allocation overhead than
+    /// their source bytes suggest.
+    pub fn heap_bytes(&self) -> usize {
+        self.blocks
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Arc<TopBlock>>())
+            .saturating_add(
+                self.blocks
+                    .iter()
+                    .map(|top| {
+                        std::mem::size_of::<TopBlock>().saturating_add(block_heap_bytes(&top.block))
+                    })
+                    .sum::<usize>(),
+            )
+    }
+}
+
+fn inline_runs_heap_bytes(runs: &Vec<InlineRun>) -> usize {
+    runs.capacity()
+        .saturating_mul(std::mem::size_of::<InlineRun>())
+        .saturating_add(
+            runs.iter()
+                .map(|run| {
+                    run.text
+                        .capacity()
+                        .saturating_add(run.style.link.as_ref().map_or(0, |link| link.capacity()))
+                })
+                .sum::<usize>(),
+        )
+}
+
+fn block_vec_heap_bytes(blocks: &Vec<Block>) -> usize {
+    blocks
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Block>())
+        .saturating_add(blocks.iter().map(block_heap_bytes).sum::<usize>())
+}
+
+fn block_heap_bytes(block: &Block) -> usize {
+    match block {
+        Block::Paragraph { runs } | Block::Heading { runs, .. } => inline_runs_heap_bytes(runs),
+        Block::CodeBlock { language, code } => language
+            .as_ref()
+            .map_or(0, |language| language.capacity())
+            .saturating_add(code.capacity()),
+        Block::BlockQuote { children } => block_vec_heap_bytes(children),
+        Block::List { items, .. } => items
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<Block>>())
+            .saturating_add(
+                items
+                    .iter()
+                    .map(|children| block_vec_heap_bytes(children))
+                    .sum::<usize>(),
+            ),
+        Block::Table {
+            header,
+            rows,
+            align,
+        } => {
+            let header_bytes = header
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Vec<InlineRun>>())
+                .saturating_add(
+                    header
+                        .iter()
+                        .map(|cell| inline_runs_heap_bytes(cell))
+                        .sum::<usize>(),
+                );
+            let rows_bytes = rows
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Vec<Vec<InlineRun>>>())
+                .saturating_add(
+                    rows.iter()
+                        .map(|row| {
+                            row.capacity()
+                                .saturating_mul(std::mem::size_of::<Vec<InlineRun>>())
+                                .saturating_add(
+                                    row.iter()
+                                        .map(|cell| inline_runs_heap_bytes(cell))
+                                        .sum::<usize>(),
+                                )
+                        })
+                        .sum::<usize>(),
+                );
+            header_bytes.saturating_add(rows_bytes).saturating_add(
+                align
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<TableAlign>()),
+            )
+        }
+        Block::Rule => 0,
     }
 }
 
@@ -123,17 +227,17 @@ pub fn parse_full(source: &str) -> BlockTree {
         match event {
             Event::Rule => {
                 cur.bump();
-                blocks.push(TopBlock {
+                blocks.push(Arc::new(TopBlock {
                     range,
                     block: Block::Rule,
-                });
+                }));
             }
             Event::Start(_) => {
                 for block in parse_started_block(&mut cur) {
-                    blocks.push(TopBlock {
+                    blocks.push(Arc::new(TopBlock {
                         range: range.clone(),
                         block,
-                    });
+                    }));
                 }
             }
             // Stray inline events at top level (shouldn't happen): skip.
@@ -462,7 +566,7 @@ pub struct IncrementalParser {
     /// has hanging inline markers ([`super::mend`]): `None` means the display
     /// tree is exactly [`Self::tree`]. Never fed back into the incremental
     /// state — the canonical tree stays parity-exact with `parse_full`.
-    display_tail: Option<Vec<TopBlock>>,
+    display_tail: Option<Vec<Arc<TopBlock>>>,
     /// Link-reference definitions act at a distance — full reparses only.
     full_only: bool,
     /// Bytes fed through `parse_full` by the most recent `set_text`/`append`/
@@ -580,10 +684,11 @@ impl IncrementalParser {
         self.last_parse_bytes = self.source.len() - boundary;
         self.tree.blocks.retain(|b| b.range.start < boundary);
         self.stable_prefix_blocks = self.tree.blocks.len();
-        for mut top in tail.blocks {
+        for top in tail.blocks {
+            let mut top = Arc::unwrap_or_clone(top);
             top.range.start += boundary;
             top.range.end += boundary;
-            self.tree.blocks.push(top);
+            self.tree.blocks.push(Arc::new(top));
         }
         self.remend();
     }
@@ -616,6 +721,7 @@ impl IncrementalParser {
         self.last_parse_bytes += mended.len();
         let mut tail = parse_full(&mended).blocks;
         for top in &mut tail {
+            let top = Arc::make_mut(top);
             // Display ranges point back into the unmended source; synthetic
             // closers at the end clamp away.
             top.range.start += start;
@@ -718,6 +824,24 @@ mod tests {
                 }
                 prev = cur.clone();
             }
+        }
+    }
+
+    #[test]
+    fn streaming_display_trees_share_stable_top_level_blocks() {
+        let mut parser = IncrementalParser::new();
+        parser.set_text("first\n\nsecond\n\nthird\n\nfourth");
+        let before = parser.display_tree();
+        assert!(before.blocks.len() >= 4);
+
+        parser.append(" grows");
+        let after = parser.display_tree();
+        assert!(parser.stable_prefix_blocks() >= 2);
+        for index in 0..parser.stable_prefix_blocks() {
+            assert!(
+                Arc::ptr_eq(&before.blocks[index], &after.blocks[index]),
+                "stable block {index} was deep-cloned"
+            );
         }
     }
 
@@ -983,6 +1107,36 @@ mod tests {
         let mut p = IncrementalParser::new();
         p.append("");
         assert!(p.tree().is_empty());
+    }
+
+    #[test]
+    fn heap_bytes_accounts_for_nested_content_and_spare_capacity() {
+        let markdown = concat!(
+            "> - [linked text](https://example.com/a/long/path)\n",
+            ">   - nested **bold** and `inline code`\n\n",
+            "| name | description |\n",
+            "| :--- | ---: |\n",
+            "| alpha | a table cell with several words |\n",
+            "| beta | another table cell |\n\n",
+            "```rust\nlet value = String::from(\"payload\");\n```\n",
+        );
+        let tree = parse_full(markdown);
+        assert!(tree.heap_bytes() > markdown.len());
+
+        // Capacity, rather than just length, is resident allocation. Hold a
+        // deliberately sparse run vector to guard against under-counting it.
+        let mut runs = Vec::with_capacity(64);
+        runs.push(InlineRun {
+            text: "x".to_owned(),
+            style: InlineStyle::default(),
+        });
+        let sparse = BlockTree {
+            blocks: vec![Arc::new(TopBlock {
+                range: 0..1,
+                block: Block::Paragraph { runs },
+            })],
+        };
+        assert!(sparse.heap_bytes() >= 64usize.saturating_mul(std::mem::size_of::<InlineRun>()));
     }
 }
 

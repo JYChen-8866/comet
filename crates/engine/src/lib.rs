@@ -21,7 +21,9 @@ pub mod titles;
 pub mod uploads;
 pub mod workspace_host;
 
-pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig};
+pub use doc_host::{
+    ChatDocHandle, DocHost, DocHostConfig, DocHostMemoryDiagnostics, TranscriptSnapshot,
+};
 pub use instance_lock::InstanceLock;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use rpc::EngineRpc;

@@ -11,6 +11,8 @@
 //! isError?, questions?: json, resolved?, message? }. Text bodies are **LoroText** so streaming
 //! appends RLE-merge (1.03x oplog overhead vs 125x for whole-value rewrites).
 
+use std::collections::{HashMap, VecDeque};
+
 use loro::{ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
@@ -206,22 +208,251 @@ impl SessionDoc {
     /// whole transcript — one bad entry took down every publish for the chat
     /// (2026-07-31, "missing field `id`" during a multi-update import).
     pub fn read_entries(&self) -> Result<Vec<SessionMessageEntry>, DocError> {
-        let value = self.doc.get_deep_value().to_json_value();
-        let messages = value
-            .get("messages")
-            .cloned()
-            .unwrap_or(serde_json::json!([]));
-        let raw: Vec<serde_json::Value> = serde_json::from_value(messages)?;
-        Ok(raw
-            .into_iter()
-            .filter_map(|v| match entry_from_json(v) {
-                Ok(entry) => Some(entry),
+        let messages = self.doc.get_list("messages");
+        let mut entries = Vec::with_capacity(messages.len());
+        for index in 0..messages.len() {
+            let Some(map) = message_map_at(&messages, index) else {
+                continue;
+            };
+            match entry_from_map(&map) {
+                Ok(entry) => entries.push(entry),
                 Err(err) => {
-                    tracing::warn!(error = %err, "skipping malformed transcript entry");
-                    None
+                    tracing::warn!(error = %err, index, "skipping malformed transcript entry");
                 }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Read only the newest `limit` entries without deep-converting the whole
+    /// document.  Chat history can be much larger than the provider context;
+    /// callers that only need a prompt window must not pay an allocation for
+    /// every old message first.
+    pub fn read_entries_tail(&self, limit: usize) -> Result<Vec<SessionMessageEntry>, DocError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let messages = self.doc.get_list("messages");
+        let start = messages.len().saturating_sub(limit);
+        let mut entries = Vec::with_capacity(messages.len().saturating_sub(start));
+        for index in start..messages.len() {
+            let Some(map) = message_map_at(&messages, index) else {
+                continue;
+            };
+            match entry_from_map(&map) {
+                Ok(entry) => entries.push(entry),
+                Err(err) => {
+                    tracing::warn!(error = %err, index, "skipping malformed transcript entry");
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Check an idempotency key without decoding any message parts.
+    pub fn contains_message_id(&self, message_id: &str) -> bool {
+        let messages = self.doc.get_list("messages");
+        (0..messages.len()).any(|index| {
+            message_map_at(&messages, index).is_some_and(|map| {
+                matches!(
+                    map.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(id)))
+                        if id.as_str() == message_id
+                )
             })
-            .collect())
+        })
+    }
+
+    /// Valid message ids in CRDT list order. This is the command evaluator's
+    /// complete turn index; retaining ids is enough for past/current checks
+    /// and avoids retaining every historical body during a command drain.
+    pub fn message_ids(&self) -> Vec<String> {
+        let messages = self.doc.get_list("messages");
+        let mut ids = Vec::with_capacity(messages.len());
+        for index in 0..messages.len() {
+            let Some(map) = message_map_at(&messages, index) else {
+                continue;
+            };
+            if let Ok(metadata) = entry_metadata_from_map(&map) {
+                ids.push(metadata.id);
+            }
+        }
+        ids
+    }
+
+    /// Last valid raw message id, without materializing the entry body.
+    pub fn last_message_id(&self) -> Option<String> {
+        let messages = self.doc.get_list("messages");
+        (0..messages.len()).rev().find_map(|index| {
+            message_map_at(&messages, index)
+                .and_then(|map| entry_metadata_from_map(&map).ok())
+                .map(|metadata| metadata.id)
+        })
+    }
+
+    /// Visit user-authored text parts one at a time. Returning false stops the
+    /// scan. Callers such as the resident-document registry can therefore
+    /// inspect a long history with memory bounded by its largest individual
+    /// text part and stop as soon as their own result budget is full.
+    pub fn visit_user_text_parts(
+        &self,
+        mut visitor: impl FnMut(&str) -> bool,
+    ) -> Result<(), DocError> {
+        let messages = self.doc.get_list("messages");
+        for entry_index in 0..messages.len() {
+            let Some(entry) = message_map_at(&messages, entry_index) else {
+                continue;
+            };
+            if !matches!(
+                optional_map_string(&entry, "role"),
+                Ok(Some(role)) if role == "user"
+            ) {
+                continue;
+            }
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                continue;
+            };
+            for part_index in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(part_index)
+                else {
+                    continue;
+                };
+                if !matches!(
+                    optional_map_string(&part, "kind"),
+                    Ok(Some(kind)) if kind == "text"
+                ) {
+                    continue;
+                }
+                let text = match part.get("text") {
+                    Some(loro::ValueOrContainer::Container(loro::Container::Text(text))) => {
+                        text.to_string()
+                    }
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(text))) => {
+                        text.to_string()
+                    }
+                    None | Some(loro::ValueOrContainer::Value(LoroValue::Null)) => String::new(),
+                    Some(_) => continue,
+                };
+                if !visitor(&text) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the newest `limit` entries after continuation joining without
+    /// materializing old message bodies. The first pass reads only entry ids,
+    /// continuation links, and schema types to identify the final tail. The
+    /// second pass decodes text/tool payloads only for roots that survived in
+    /// that tail (and continuations targeting those roots).
+    pub fn read_joined_entries_tail(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<SessionMessageEntry>, DocError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.read_joined_tail_with_total(limit)
+            .map(|(entries, _)| entries)
+    }
+
+    pub(crate) fn read_joined_tail_with_total(
+        &self,
+        limit: usize,
+    ) -> Result<(Vec<SessionMessageEntry>, usize), DocError> {
+        #[derive(Clone, Copy)]
+        struct TailSlot {
+            ordinal: usize,
+        }
+
+        let messages = self.doc.get_list("messages");
+        let mut roots = HashMap::<String, usize>::new();
+        let mut tail = VecDeque::<TailSlot>::with_capacity(limit.min(messages.len()));
+        let mut total = 0usize;
+
+        // Pass one never materializes a message body. It only resolves which
+        // joined roots occupy the final tail and validates the same schema
+        // types that a full entry decode requires.
+        for index in 0..messages.len() {
+            let Some(map) = message_map_at(&messages, index) else {
+                continue;
+            };
+            let metadata = match entry_metadata_from_map(&map) {
+                Ok(metadata) => metadata,
+                Err(err) => {
+                    tracing::warn!(error = %err, index, "skipping malformed transcript entry");
+                    continue;
+                }
+            };
+            let continuation_target = metadata
+                .continuation_of
+                .as_deref()
+                .and_then(|root_id| roots.get(root_id).copied());
+            if continuation_target.is_some() {
+                continue;
+            }
+
+            // An orphan continuation is surfaced as its own joined entry, but
+            // (matching `join_continuation_entries`) it does not become a root
+            // that later continuation entries can target.
+            if metadata.continuation_of.is_none() {
+                roots.insert(metadata.id, total);
+            }
+            tail.push_back(TailSlot { ordinal: total });
+            total = total.saturating_add(1);
+            if tail.len() > limit {
+                tail.pop_front();
+            }
+        }
+
+        let selected = tail
+            .iter()
+            .enumerate()
+            .map(|(tail_index, slot)| (slot.ordinal, tail_index))
+            .collect::<HashMap<_, _>>();
+        let mut output: Vec<Option<SessionMessageEntry>> = vec![None; tail.len()];
+
+        // Pass two decodes only the selected roots and continuations that
+        // contribute parts to them. Old text/tool bodies are never allocated.
+        roots.clear();
+        let mut ordinal = 0usize;
+        for index in 0..messages.len() {
+            let Some(map) = message_map_at(&messages, index) else {
+                continue;
+            };
+            let Ok(metadata) = entry_metadata_from_map(&map) else {
+                continue;
+            };
+            let continuation_target = metadata
+                .continuation_of
+                .as_deref()
+                .and_then(|root_id| roots.get(root_id).copied());
+            if let Some(target) = continuation_target {
+                if let Some(&tail_index) = selected.get(&target)
+                    && let Ok(continuation) = entry_from_map(&map)
+                    && let Some(root) = output[tail_index].as_mut()
+                {
+                    root.parts.extend(continuation.parts);
+                }
+                continue;
+            }
+
+            if metadata.continuation_of.is_none() {
+                roots.insert(metadata.id, ordinal);
+            }
+            if let Some(&tail_index) = selected.get(&ordinal)
+                && let Ok(entry) = entry_from_map(&map)
+            {
+                output[tail_index] = Some(entry);
+            }
+            ordinal = ordinal.saturating_add(1);
+        }
+
+        Ok((output.into_iter().flatten().collect(), total))
     }
 
     /// Read the commands ledger.
@@ -230,22 +461,25 @@ impl SessionDoc {
     /// here, and one malformed entry must not wedge command draining for the
     /// chat forever (an unparseable command can't be executed anyway).
     pub fn read_commands(&self) -> Result<Vec<SessionCommandEntry>, DocError> {
-        let value = self.doc.get_deep_value().to_json_value();
-        let commands = value
-            .get("commands")
-            .cloned()
-            .unwrap_or(serde_json::json!([]));
-        let raw: Vec<serde_json::Value> = serde_json::from_value(commands)?;
-        Ok(raw
-            .into_iter()
-            .filter_map(|v| match serde_json::from_value(v) {
-                Ok(entry) => Some(entry),
+        let commands = self.doc.get_list("commands");
+        let mut entries = Vec::with_capacity(commands.len());
+        for index in 0..commands.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                commands.get(index)
+            else {
+                continue;
+            };
+            // Commands contain an arbitrary tagged payload, so retain serde at
+            // this boundary, but deep-convert one command map at a time rather
+            // than cloning the complete document and command ledger first.
+            match serde_json::from_value(map.get_deep_value().to_json_value()) {
+                Ok(entry) => entries.push(entry),
                 Err(err) => {
-                    tracing::warn!(error = %err, "skipping malformed command entry");
-                    None
+                    tracing::warn!(error = %err, index, "skipping malformed command entry");
                 }
-            })
-            .collect())
+            }
+        }
+        Ok(entries)
     }
 
     /// Append a command entry (rule 1: own entries only, append-only).
@@ -505,31 +739,167 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     Ok(())
 }
 
-fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError> {
-    #[derive(Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    struct RawEntry {
-        id: String,
-        role: MessageRole,
-        #[serde(default)]
-        parts: Vec<DocPartJson>,
-        created_at: i64,
-        device_id: String,
-        #[serde(default)]
-        status: Option<MessageStatus>,
-        #[serde(default)]
-        continuation_of: Option<String>,
+#[derive(Debug)]
+struct EntryMetadata {
+    id: String,
+    continuation_of: Option<String>,
+}
+
+fn message_map_at(messages: &LoroList, index: usize) -> Option<LoroMap> {
+    match messages.get(index) {
+        Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => Some(map),
+        _ => None,
     }
-    let raw: RawEntry = serde_json::from_value(v)?;
-    Ok(SessionMessageEntry {
-        id: raw.id,
-        role: raw.role,
-        parts: raw.parts.into_iter().map(from_doc_part).collect(),
-        created_at: raw.created_at,
-        device_id: raw.device_id,
-        status: raw.status,
-        continuation_of: raw.continuation_of,
+}
+
+fn optional_map_string(map: &LoroMap, key: &str) -> Result<Option<String>, DocError> {
+    match map.get(key) {
+        None | Some(loro::ValueOrContainer::Value(LoroValue::Null)) => Ok(None),
+        Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => {
+            Ok(Some(value.to_string()))
+        }
+        Some(_) => Err(DocError::Schema(format!("`{key}` is not a string"))),
+    }
+}
+
+fn required_map_i64(map: &LoroMap, key: &str) -> Result<i64, DocError> {
+    match map.get(key) {
+        Some(loro::ValueOrContainer::Value(LoroValue::I64(value))) => Ok(value),
+        _ => Err(DocError::Schema(format!("missing field `{key}`"))),
+    }
+}
+
+fn optional_map_bool(map: &LoroMap, key: &str) -> Result<Option<bool>, DocError> {
+    match map.get(key) {
+        None | Some(loro::ValueOrContainer::Value(LoroValue::Null)) => Ok(None),
+        Some(loro::ValueOrContainer::Value(LoroValue::Bool(value))) => Ok(Some(value)),
+        Some(_) => Err(DocError::Schema(format!("`{key}` is not a bool"))),
+    }
+}
+
+fn map_json(map: &LoroMap, key: &str) -> Option<serde_json::Value> {
+    match map.get(key) {
+        None | Some(loro::ValueOrContainer::Value(LoroValue::Null)) => None,
+        Some(value) => Some(value.get_deep_value().to_json_value()),
+    }
+}
+
+fn required_map_string(map: &LoroMap, key: &str) -> Result<String, DocError> {
+    optional_map_string(map, key)?.ok_or_else(|| DocError::Schema(format!("missing field `{key}`")))
+}
+
+fn validate_parts_shape(entry: &LoroMap) -> Result<(), DocError> {
+    let parts = match entry.get("parts") {
+        None => return Ok(()),
+        Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => parts,
+        Some(_) => return Err(DocError::Schema("parts is not a list".into())),
+    };
+    for index in 0..parts.len() {
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) = parts.get(index)
+        else {
+            return Err(DocError::Schema(format!("malformed part at {index}")));
+        };
+        required_map_string(&part, "id")?;
+        required_map_string(&part, "kind")?;
+        match part.get("text") {
+            None
+            | Some(loro::ValueOrContainer::Value(LoroValue::Null))
+            | Some(loro::ValueOrContainer::Value(LoroValue::String(_)))
+            | Some(loro::ValueOrContainer::Container(loro::Container::Text(_))) => {}
+            Some(_) => return Err(DocError::Schema("text is not a string".into())),
+        }
+        optional_map_bool(&part, "isError")?;
+        optional_map_bool(&part, "resolved")?;
+        optional_map_string(&part, "message")?;
+    }
+    Ok(())
+}
+
+fn entry_metadata_from_map(map: &LoroMap) -> Result<EntryMetadata, DocError> {
+    let id = required_map_string(map, "id")?;
+    match required_map_string(map, "role")?.as_str() {
+        "user" | "assistant" | "system" => {}
+        other => return Err(DocError::Schema(format!("unknown role `{other}`"))),
+    }
+    required_map_i64(map, "createdAt")?;
+    required_map_string(map, "deviceId")?;
+    match optional_map_string(map, "status")?.as_deref() {
+        None | Some("streaming" | "complete" | "aborted") => {}
+        Some(other) => return Err(DocError::Schema(format!("unknown status `{other}`"))),
+    }
+    validate_parts_shape(map)?;
+    Ok(EntryMetadata {
+        id,
+        continuation_of: optional_map_string(map, "continuationOf")?,
     })
+}
+
+fn entry_from_map(map: &LoroMap) -> Result<SessionMessageEntry, DocError> {
+    let id = required_map_string(map, "id")?;
+    let role = match required_map_string(map, "role")?.as_str() {
+        "user" => MessageRole::User,
+        "assistant" => MessageRole::Assistant,
+        "system" => MessageRole::System,
+        other => return Err(DocError::Schema(format!("unknown role `{other}`"))),
+    };
+    let created_at = required_map_i64(map, "createdAt")?;
+    let device_id = required_map_string(map, "deviceId")?;
+    let status = match optional_map_string(map, "status")?.as_deref() {
+        None => None,
+        Some("streaming") => Some(MessageStatus::Streaming),
+        Some("complete") => Some(MessageStatus::Complete),
+        Some("aborted") => Some(MessageStatus::Aborted),
+        Some(other) => return Err(DocError::Schema(format!("unknown status `{other}`"))),
+    };
+    let parts = match map.get("parts") {
+        None => Vec::new(),
+        Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) => {
+            let mut decoded = Vec::with_capacity(parts.len());
+            for index in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(index)
+                else {
+                    return Err(DocError::Schema(format!("malformed part at {index}")));
+                };
+                decoded.push(part_from_map(&part)?);
+            }
+            decoded
+        }
+        Some(_) => return Err(DocError::Schema("parts is not a list".into())),
+    };
+    Ok(SessionMessageEntry {
+        id,
+        role,
+        parts,
+        created_at,
+        device_id,
+        status,
+        continuation_of: optional_map_string(map, "continuationOf")?,
+    })
+}
+
+fn part_from_map(map: &LoroMap) -> Result<MessagePart, DocError> {
+    let id = required_map_string(map, "id")?;
+    let kind = required_map_string(map, "kind")?;
+    let text = match map.get("text") {
+        Some(loro::ValueOrContainer::Container(loro::Container::Text(text))) => {
+            Some(text.to_string())
+        }
+        Some(loro::ValueOrContainer::Value(LoroValue::String(text))) => Some(text.to_string()),
+        Some(loro::ValueOrContainer::Value(LoroValue::Null)) | None => None,
+        Some(_) => return Err(DocError::Schema("text is not a string".into())),
+    };
+    let doc_part = DocPartJson {
+        id,
+        kind,
+        text,
+        call: map_json(map, "call"),
+        is_error: optional_map_bool(map, "isError")?,
+        questions: map_json(map, "questions"),
+        resolved: optional_map_bool(map, "resolved")?,
+        message: optional_map_string(map, "message")?,
+    };
+    Ok(from_doc_part(doc_part))
 }
 
 /// Render-time continuation join at the entry level (`joinContinuations` in TS):
@@ -559,6 +929,107 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
     out
 }
 
+/// Compact mirror of the fields already written to Loro.
+///
+/// In particular, text/error bodies and input questions are not retained here:
+/// the caller already owns the folded parts and Loro owns the durable copy. A
+/// second full `MessagePart` mirror doubled the steady live-reply footprint and
+/// cloned the accumulated text on every commit tick.
+#[derive(Debug, Clone, PartialEq)]
+enum WrittenPart {
+    Text {
+        id: String,
+        byte_len: usize,
+    },
+    Tool {
+        id: String,
+        call: comet_proto::ToolCall,
+        is_error: bool,
+        resolved: bool,
+    },
+    Input {
+        id: String,
+        resolved: bool,
+    },
+    Error {
+        id: String,
+        byte_len: usize,
+    },
+}
+
+impl WrittenPart {
+    fn from_part(part: &MessagePart) -> Self {
+        match part {
+            MessagePart::Text { id, text } => Self::Text {
+                id: id.clone(),
+                byte_len: text.len(),
+            },
+            MessagePart::Tool {
+                id,
+                call,
+                is_error,
+                resolved,
+            } => Self::Tool {
+                id: id.clone(),
+                call: call.clone(),
+                is_error: *is_error,
+                resolved: *resolved,
+            },
+            MessagePart::Input { id, resolved, .. } => Self::Input {
+                id: id.clone(),
+                resolved: *resolved,
+            },
+            MessagePart::Error { id, message } => Self::Error {
+                id: id.clone(),
+                byte_len: message.len(),
+            },
+        }
+    }
+
+    fn matches(&self, part: &MessagePart) -> bool {
+        match (self, part) {
+            (Self::Text { id, byte_len }, MessagePart::Text { id: next_id, text }) => {
+                id == next_id && *byte_len == text.len()
+            }
+            (
+                Self::Tool {
+                    id,
+                    call,
+                    is_error,
+                    resolved,
+                },
+                MessagePart::Tool {
+                    id: next_id,
+                    call: next_call,
+                    is_error: next_error,
+                    resolved: next_resolved,
+                },
+            ) => {
+                id == next_id
+                    && call == next_call
+                    && is_error == next_error
+                    && resolved == next_resolved
+            }
+            (
+                Self::Input { id, resolved },
+                MessagePart::Input {
+                    id: next_id,
+                    resolved: next_resolved,
+                    ..
+                },
+            ) => id == next_id && resolved == next_resolved,
+            (
+                Self::Error { id, byte_len },
+                MessagePart::Error {
+                    id: next_id,
+                    message,
+                },
+            ) => id == next_id && *byte_len == message.len(),
+            _ => false,
+        }
+    }
+}
+
 /// Incremental streaming writer for one assistant entry.
 ///
 /// Port of comet's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
@@ -574,8 +1045,8 @@ pub struct SegmentWriter<'a> {
     doc: &'a SessionDoc,
     /// Index of this entry in the `messages` list.
     entry_index: usize,
-    /// Mirror of what we've written so far (part id → app part).
-    written: Vec<MessagePart>,
+    /// Compact mirror of what has been written so far.
+    written: Vec<WrittenPart>,
 }
 
 impl<'a> SegmentWriter<'a> {
@@ -636,18 +1107,27 @@ impl<'a> SegmentWriter<'a> {
             match self.written.get(i) {
                 None => {
                     push_part(&parts, part)?;
-                    self.written.push(part.clone());
+                    self.written.push(WrittenPart::from_part(part));
                     dirty = true;
                 }
-                Some(prev) if prev == part => {}
+                Some(prev) if prev.matches(part) => {}
                 Some(prev) => {
                     match (prev, part) {
                         (
-                            MessagePart::Text { text: old, .. },
-                            MessagePart::Text { text: new, .. },
-                        ) if new.starts_with(old.as_str()) => {
+                            WrittenPart::Text {
+                                id,
+                                byte_len: old_len,
+                            },
+                            MessagePart::Text {
+                                id: next_id,
+                                text: new,
+                            },
+                        ) if id == next_id
+                            && *old_len <= new.len()
+                            && new.is_char_boundary(*old_len) =>
+                        {
                             // Trailing-text growth: append the suffix into the LoroText.
-                            let delta = &new[old.len()..];
+                            let delta = &new[*old_len..];
                             if !delta.is_empty() {
                                 let part_map = part_map_at(&parts, i)?;
                                 match part_map.get("text") {
@@ -675,7 +1155,7 @@ impl<'a> SegmentWriter<'a> {
                             dirty = true;
                         }
                     }
-                    self.written[i] = part.clone();
+                    self.written[i] = WrittenPart::from_part(part);
                 }
             }
         }
@@ -752,17 +1232,16 @@ pub fn materialize_tail(
     now: i64,
     tail_count: usize,
 ) -> Result<SessionTail, DocError> {
-    let all = join_continuation_entries(doc.read_entries()?);
-    let total = all.len();
-    let start = total.saturating_sub(if tail_count == 0 {
+    let limit = if tail_count == 0 {
         TAIL_MESSAGE_COUNT
     } else {
         tail_count
-    });
+    };
+    let (messages, total) = doc.read_joined_tail_with_total(limit)?;
     Ok(SessionTail {
         chat_id: doc.chat_id().unwrap_or_default(),
         schema_version: SESSION_SCHEMA_VERSION,
-        messages: all[start..].to_vec(),
+        messages,
         total_messages: total,
         updated_at: now,
     })
@@ -804,6 +1283,36 @@ mod tests {
             }]
         );
         assert_eq!(doc.chat_id().as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn read_entries_tail_reads_only_newest_entries() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        for i in 0..5 {
+            doc.push_message(&user_entry(&format!("m{i}"), &format!("msg {i}")))
+                .unwrap();
+        }
+        let entries = doc.read_entries_tail(2).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m3", "m4"]
+        );
+    }
+
+    #[test]
+    fn message_id_metadata_reads_do_not_decode_bodies() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        doc.push_message(&user_entry("m0", &"x".repeat(1024 * 1024)))
+            .unwrap();
+        doc.push_message(&user_entry("m1", "tail")).unwrap();
+
+        assert!(doc.contains_message_id("m0"));
+        assert!(!doc.contains_message_id("missing"));
+        assert_eq!(doc.message_ids(), ["m0", "m1"]);
+        assert_eq!(doc.last_message_id().as_deref(), Some("m1"));
     }
 
     #[test]
@@ -928,6 +1437,40 @@ mod tests {
     }
 
     #[test]
+    fn segment_writer_keeps_only_text_length_in_its_mirror() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+        let mut text = "x".repeat(512 * 1024);
+        let mut folded = vec![MessagePart::Text {
+            id: "t0".into(),
+            text: text.clone(),
+        }];
+        writer.sync(&folded).unwrap();
+        assert!(matches!(
+            writer.written.as_slice(),
+            [WrittenPart::Text { byte_len, .. }] if *byte_len == text.len()
+        ));
+
+        text.push_str(" tail");
+        let MessagePart::Text { text: live, .. } = &mut folded[0] else {
+            unreachable!();
+        };
+        live.push_str(" tail");
+        writer.sync(&folded).unwrap();
+        assert!(matches!(
+            writer.written.as_slice(),
+            [WrittenPart::Text { byte_len, .. }] if *byte_len == text.len()
+        ));
+
+        writer.finish(&folded, MessageStatus::Complete).unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert!(matches!(
+            &entries[0].parts[0],
+            MessagePart::Text { text: persisted, .. } if persisted == &text
+        ));
+    }
+
+    #[test]
     fn set_message_status_stamps_existing_entry() {
         let doc = SessionDoc::init("chat-1").unwrap();
         let mut entry = user_entry("m1", "hello");
@@ -985,5 +1528,65 @@ mod tests {
         assert_eq!(tail.messages.len(), 2);
         assert_eq!(tail.messages[1].id, "m4");
         assert_eq!(tail.chat_id, "chat-1");
+    }
+
+    #[test]
+    fn joined_tail_decodes_only_selected_roots_and_their_continuations() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let push = |id: &str, text: &str, continuation_of: Option<&str>| {
+            let mut entry = user_entry(id, text);
+            entry.continuation_of = continuation_of.map(str::to_owned);
+            doc.push_message(&entry).unwrap();
+        };
+        push("m0", "zero", None);
+        push("m1", "one", None);
+        push("c0", "zero tail", Some("m0"));
+        push("c1", "one tail", Some("m1"));
+        push("m2", "two", None);
+
+        let tail = materialize_tail(&doc, 99, 2).unwrap();
+        assert_eq!(tail.total_messages, 3);
+        assert_eq!(
+            tail.messages
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["m1", "m2"]
+        );
+        assert_eq!(tail.messages[0].parts.len(), 2);
+        assert!(matches!(
+            &tail.messages[0].parts[1],
+            MessagePart::Text { text, .. } if text == "one tail"
+        ));
+        assert_eq!(tail.messages[1].parts.len(), 1);
+    }
+
+    #[test]
+    fn joined_tail_matches_orphan_and_duplicate_root_semantics() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let push = |id: &str, text: &str, continuation_of: Option<&str>| {
+            let mut entry = user_entry(id, text);
+            entry.continuation_of = continuation_of.map(str::to_owned);
+            doc.push_message(&entry).unwrap();
+        };
+        // An orphan continuation is its own joined row and does not become a
+        // root. The next continuation targeting its id is therefore another
+        // orphan row.
+        push("orphan", "first", Some("missing"));
+        push("orphan-child", "second", Some("orphan"));
+        // Duplicate root ids are legal under convergence; subsequent
+        // continuations target the most recently inserted duplicate.
+        push("dup", "old", None);
+        push("dup", "new", None);
+        push("dup-tail", "new tail", Some("dup"));
+
+        let expected = join_continuation_entries(doc.read_entries().unwrap());
+        let actual = doc.read_joined_entries_tail(3).unwrap();
+        assert_eq!(actual, expected[expected.len() - 3..]);
+        assert_eq!(actual[2].parts.len(), 2);
+        assert!(matches!(
+            &actual[2].parts[1],
+            MessagePart::Text { text, .. } if text == "new tail"
+        ));
     }
 }

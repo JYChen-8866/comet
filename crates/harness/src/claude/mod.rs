@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
@@ -279,7 +279,7 @@ impl Harness for ClaudeHarness {
             });
         }
 
-        let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinMsg>();
+        let (stdin_tx, stdin_rx) = mpsc::channel::<StdinMsg>(STDIN_QUEUE_CAPACITY);
         tokio::spawn(stdin_writer(stdin, stdin_rx));
 
         // The initial prompt as the first stdin user line (streaming-input
@@ -293,7 +293,10 @@ impl Harness for ClaudeHarness {
             &apply_ultrathink(request.reasoning, &request.prompt),
             &images,
         );
-        let _ = stdin_tx.send(StdinMsg::Line(first));
+        stdin_tx
+            .send(StdinMsg::Line(first))
+            .await
+            .map_err(|_| HarnessError::Protocol("claude child stdin closed".into()))?;
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
@@ -325,6 +328,12 @@ enum StdinMsg {
 /// Anthropic's API caps inline images at 5MB of raw bytes; larger files stay
 /// path refs only.
 const MAX_INLINE_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+// Base64 and the final JSON line temporarily coexist. A total raw-byte budget
+// keeps that serialization peak bounded while still allowing several normal
+// screenshots in one turn.
+const MAX_INLINE_IMAGE_TOTAL_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_INLINE_IMAGE_COUNT: usize = 8;
+const STDIN_QUEUE_CAPACITY: usize = 32;
 
 /// Media type for an inline image block — extension first, magic bytes as the
 /// fallback (pasted screenshots may carry odd names). Only the API-supported
@@ -369,24 +378,46 @@ fn image_media_type(path: &std::path::Path, bytes: &[u8]) -> Option<&'static str
 /// unreadable, oversized, or unsupported file is skipped — its path ref still
 /// rides the prompt text — never fatal to the run.
 async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
+    load_image_blocks_with_limits(
+        paths,
+        MAX_INLINE_IMAGE_BYTES,
+        MAX_INLINE_IMAGE_TOTAL_BYTES,
+        MAX_INLINE_IMAGE_COUNT,
+    )
+    .await
+}
+
+async fn load_image_blocks_with_limits(
+    paths: &[String],
+    per_image_bytes: u64,
+    total_bytes: u64,
+    max_count: usize,
+) -> Vec<wire::ImageBlock> {
     use base64::Engine as _;
     let mut blocks = Vec::new();
+    let mut admitted_bytes = 0_u64;
     for path in paths {
-        let bytes = match tokio::fs::read(path).await {
-            Ok(bytes) => bytes,
+        if blocks.len() >= max_count || admitted_bytes >= total_bytes {
+            break;
+        }
+        let remaining = total_bytes.saturating_sub(admitted_bytes);
+        let read_limit = per_image_bytes.min(remaining);
+        let bytes = match read_file_bounded(std::path::Path::new(path), read_limit).await {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                tracing::debug!(target: "comet_harness::claude", %path, "attachment over inline cap; path ref only");
+                continue;
+            }
             Err(err) => {
                 tracing::warn!(target: "comet_harness::claude", %path, error = %err, "attachment unreadable; path ref only");
                 continue;
             }
         };
-        if bytes.len() as u64 > MAX_INLINE_IMAGE_BYTES {
-            tracing::debug!(target: "comet_harness::claude", %path, "attachment over inline cap; path ref only");
-            continue;
-        }
         let Some(media_type) = image_media_type(std::path::Path::new(path), &bytes) else {
             tracing::debug!(target: "comet_harness::claude", %path, "attachment not an inline-supported image; path ref only");
             continue;
         };
+        admitted_bytes = admitted_bytes.saturating_add(bytes.len() as u64);
         blocks.push(wire::ImageBlock {
             media_type: media_type.to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -395,9 +426,25 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
     blocks
 }
 
+/// Reads at most `limit + 1` bytes even if the file grows after `metadata`.
+/// Returning `None` means the file is not a regular file or exceeds the cap.
+async fn read_file_bounded(path: &std::path::Path, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let metadata = tokio::fs::metadata(path).await?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return Ok(None);
+    }
+    let file = tokio::fs::File::open(path).await?;
+    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await?;
+    Ok(((bytes.len() as u64) <= limit).then_some(bytes))
+}
+
 /// Owns the child's stdin; a write failure (EPIPE after the child died) is
 /// tolerated and logged, matching the TS harness's swallowed-EPIPE behavior.
-async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<StdinMsg>) {
+async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::Receiver<StdinMsg>) {
     while let Some(msg) = rx.recv().await {
         match msg {
             StdinMsg::Line(line) => {
@@ -422,7 +469,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 struct Session {
     child: Child,
     stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    stdin_tx: mpsc::UnboundedSender<StdinMsg>,
+    stdin_tx: mpsc::Sender<StdinMsg>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     reasoning: Option<ReasoningLevel>,
@@ -477,7 +524,7 @@ async fn run_session(session: Session) {
                         }
                     };
                     if let Frame::ControlRequest(req) = frame {
-                        handle_control_request(req, &request_input, &stdin_tx);
+                        handle_control_request(req, &request_input, &stdin_tx).await;
                         continue;
                     }
                     for ev in norm.normalize(frame, interrupted) {
@@ -504,7 +551,7 @@ async fn run_session(session: Session) {
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
-                    let _ = stdin_tx.send(StdinMsg::Line(line));
+                    let _ = stdin_tx.send(StdinMsg::Line(line)).await;
                     // The CLI consumes the queued line at its own step
                     // boundary; rotate the assistant message id so post-steer
                     // output folds into a fresh message.
@@ -521,14 +568,16 @@ async fn run_session(session: Session) {
                     // Mailbox closed: end the input so the run can finish
                     // after the current turn (mirrors claude.ts steeredInput).
                     steering_open = false;
-                    let _ = stdin_tx.send(StdinMsg::Close);
+                    let _ = stdin_tx.send(StdinMsg::Close).await;
                 }
             },
 
             _ = interrupt.cancelled(), if !interrupt_sent => {
                 interrupt_sent = true;
                 interrupted = true;
-                let _ = stdin_tx.send(StdinMsg::Line(wire::interrupt_request_line("int_1")));
+                let _ = stdin_tx
+                    .send(StdinMsg::Line(wire::interrupt_request_line("int_1")))
+                    .await;
                 // Escalate if the CLI doesn't wind down within the grace
                 // periods: SIGTERM (kills bash trees, runs SessionEnd hooks),
                 // then SIGKILL. Aborted once the child is reaped.
@@ -628,10 +677,10 @@ type RequestInputFn = Box<
 /// lifecycle), wait for the user's answers (in a subtask so the frame loop
 /// keeps flowing), and hand them back keyed by question text, as the tool
 /// expects.
-fn handle_control_request(
+async fn handle_control_request(
     req: ControlRequestFrame,
     request_input: &Arc<RequestInputFn>,
-    stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
+    stdin_tx: &mpsc::Sender<StdinMsg>,
 ) {
     if req.request.subtype != "can_use_tool" {
         tracing::debug!(
@@ -642,7 +691,7 @@ fn handle_control_request(
     }
     if req.request.tool_name != "AskUserQuestion" {
         let line = control_response_line(&req.request_id, allow_response(req.request.input));
-        let _ = stdin_tx.send(StdinMsg::Line(line));
+        let _ = stdin_tx.send(StdinMsg::Line(line)).await;
         return;
     }
     let request_input = Arc::clone(request_input);
@@ -663,7 +712,7 @@ fn handle_control_request(
         let answers = (request_input)(questions.clone()).await.unwrap_or_default();
         let updated = updated_input_with_answers(&input, &questions, &answers);
         let line = control_response_line(&request_id, allow_response(updated));
-        let _ = stdin_tx.send(StdinMsg::Line(line));
+        let _ = stdin_tx.send(StdinMsg::Line(line)).await;
     });
 }
 
@@ -740,6 +789,40 @@ fn updated_input_with_answers(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn fake_png_bytes(extra: usize) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(bytes.len() + extra, 0);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn bounded_attachment_reader_never_materializes_an_oversized_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("large.png");
+        std::fs::write(&path, fake_png_bytes(16)).unwrap();
+
+        assert!(read_file_bounded(&path, 8).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn inline_images_respect_total_bytes_and_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.png");
+        let second = directory.path().join("second.png");
+        std::fs::write(&first, fake_png_bytes(0)).unwrap();
+        std::fs::write(&second, fake_png_bytes(0)).unwrap();
+        let paths = vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ];
+
+        let total_limited = load_image_blocks_with_limits(&paths, 16, 12, 8).await;
+        assert_eq!(total_limited.len(), 1);
+
+        let count_limited = load_image_blocks_with_limits(&paths, 16, 32, 1).await;
+        assert_eq!(count_limited.len(), 1);
+    }
 
     #[test]
     fn parses_questions_tolerantly() {

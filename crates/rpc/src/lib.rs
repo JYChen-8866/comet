@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 mod client;
 mod server;
 
-pub use client::{RpcClient, connect_ws};
+pub use client::{RpcClient, RpcStream, connect_ws};
 pub use server::{serve_connection, serve_ws_listener};
 
 /// RPC method names — single source of truth for both ends.
@@ -231,5 +231,57 @@ mod tests {
         // The next unary call still works — the dead stream didn't wedge the connection.
         let echoed = client.call("Echo", serde_json::json!(2)).await.unwrap();
         assert_eq!(echoed, serde_json::json!(2));
+    }
+
+    #[tokio::test]
+    async fn dropping_client_closes_outliving_stream_receiver() {
+        let client = memory_client(Arc::new(TestService));
+        let mut items = client
+            .subscribe("Never", serde_json::Value::Null)
+            .await
+            .unwrap();
+        drop(client);
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), items.recv())
+                .await
+                .expect("stream stayed open after client drop"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_stream_consumer_is_coalesced_and_does_not_block_unary_calls() {
+        let client = memory_client(Arc::new(TestService));
+        let count = 65;
+        let mut items = client
+            .subscribe_latest("Count", serde_json::json!({"n": count}))
+            .await
+            .unwrap();
+
+        // Do not poll the stream while the server emits its entire burst. The
+        // connection reader must keep draining/coalescing and remain able to
+        // route an unrelated unary reply on the same multiplexed transport.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !items.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("burst stream did not settle");
+        let echoed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client.call("Echo", serde_json::json!("still-responsive")),
+        )
+        .await
+        .expect("unary call was head-of-line blocked")
+        .unwrap();
+        assert_eq!(echoed, serde_json::json!("still-responsive"));
+
+        let mut seen = Vec::new();
+        while let Some(value) = items.recv().await {
+            seen.push(value.as_u64().unwrap());
+        }
+        assert_eq!(seen, vec![count - 1]);
     }
 }

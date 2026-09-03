@@ -12,7 +12,9 @@
 //! - failures are logged and swallowed — a missing player must never bother
 //!   the session flow.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const DISABLE_ENV: &str = "COMET_DISABLE_SOUND";
@@ -20,6 +22,97 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.wav");
 static SOUND_REQUEST: &[u8] = include_bytes!("../assets/sounds/request.wav");
+const SOUND_QUEUE_CAPACITY: usize = 8;
+
+struct SoundQueue {
+    state: Mutex<VecDeque<Sound>>,
+    wake: Condvar,
+}
+
+impl SoundQueue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(VecDeque::with_capacity(SOUND_QUEUE_CAPACITY)),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Enqueue one edge notification without ever blocking the caller. A
+    /// burst of identical transitions is one user-visible notification; when
+    /// the bounded queue is full, input requests outrank completion chimes.
+    fn push(&self, sound: Sound) -> bool {
+        let mut queue = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if queue.back().is_some_and(|queued| *queued == sound) {
+            return false;
+        }
+        if queue.len() >= SOUND_QUEUE_CAPACITY {
+            let remove = match sound {
+                Sound::Request => queue
+                    .iter()
+                    .position(|queued| *queued == Sound::Done)
+                    .or(Some(0)),
+                Sound::Done => queue
+                    .iter()
+                    .position(|queued| *queued == Sound::Done),
+            };
+            let Some(index) = remove else {
+                return false;
+            };
+            queue.remove(index);
+        }
+        queue.push_back(sound);
+        self.wake.notify_one();
+        true
+    }
+
+    fn pop(&self) -> Sound {
+        let mut queue = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        loop {
+            if let Some(sound) = queue.pop_front() {
+                return sound;
+            }
+            queue = self
+                .wake
+                .wait(queue)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Vec<Sound> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .copied()
+            .collect()
+    }
+}
+
+fn sound_queue() -> &'static Arc<SoundQueue> {
+    static QUEUE: OnceLock<Arc<SoundQueue>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let queue = Arc::new(SoundQueue::new());
+        let worker_queue = queue.clone();
+        std::thread::Builder::new()
+            .name("comet-sound".into())
+            // The worker only waits and invokes a short-lived child process;
+            // keep its reserved stack below the platform default.
+            .stack_size(256 * 1024)
+            .spawn(move || loop {
+                let sound = worker_queue.pop();
+                let data = match sound {
+                    Sound::Done => SOUND_DONE,
+                    Sound::Request => SOUND_REQUEST,
+                };
+                if let Err(err) = play_bytes(data) {
+                    tracing::debug!(?sound, error = %err, "notification sound playback failed");
+                }
+            })
+            .expect("spawn Comet sound worker");
+        queue
+    })
+}
 
 /// Which notification chime to play.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,21 +123,14 @@ pub enum Sound {
     Request,
 }
 
-/// Play a chime on a background thread. Silently a no-op when disabled or no
-/// player is available.
+/// Queue a chime for the single background sound worker. Silently a no-op when
+/// disabled or no player is available. The queue is bounded and never blocks a
+/// GPUI/event callback.
 pub fn play(sound: Sound) {
     if std::env::var_os(DISABLE_ENV).is_some() {
         return;
     }
-    std::thread::spawn(move || {
-        let data = match sound {
-            Sound::Done => SOUND_DONE,
-            Sound::Request => SOUND_REQUEST,
-        };
-        if let Err(err) = play_bytes(data) {
-            tracing::debug!(?sound, error = %err, "notification sound playback failed");
-        }
-    });
+    let _ = sound_queue().push(sound);
 }
 
 fn play_bytes(data: &[u8]) -> Result<(), String> {
@@ -202,5 +288,34 @@ mod tests {
             assert_eq!(&data[..4], b"RIFF");
             assert_eq!(&data[8..12], b"WAVE");
         }
+    }
+
+    #[test]
+    fn sound_queue_coalesces_duplicate_edges_without_blocking() {
+        let queue = SoundQueue::new();
+
+        assert!(queue.push(Sound::Done));
+        assert!(!queue.push(Sound::Done));
+        assert!(queue.push(Sound::Request));
+
+        assert_eq!(queue.snapshot(), vec![Sound::Done, Sound::Request]);
+    }
+
+    #[test]
+    fn sound_queue_is_bounded_and_preserves_requests_over_done_burst() {
+        let queue = SoundQueue::new();
+        for index in 0..SOUND_QUEUE_CAPACITY {
+            // Alternate entries so the adjacent-edge coalescer does not
+            // collapse the fixture into one item.
+            assert!(queue.push(if index % 2 == 0 {
+                Sound::Request
+            } else {
+                Sound::Done
+            }));
+        }
+        assert_eq!(queue.snapshot().len(), SOUND_QUEUE_CAPACITY);
+        assert!(queue.push(Sound::Request));
+        assert!(queue.snapshot().contains(&Sound::Request));
+        assert!(queue.snapshot().len() <= SOUND_QUEUE_CAPACITY);
     }
 }

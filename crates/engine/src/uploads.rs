@@ -12,6 +12,8 @@
 //! (the RPC layer supplies the cwd roots) — and only supported image types, as
 //! in comet.
 
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,6 +28,18 @@ use crate::EngineError;
 const STAGING_TTL: Duration = Duration::from_secs(10 * 60);
 /// Hard cap on an assembled file.
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// Bound one staged base64 chunk so a compromised client cannot make
+/// `commit` allocate an arbitrarily large temporary string. Normal relay
+/// chunks are roughly 60 KiB, so this leaves ample headroom while keeping the
+/// decoder's working set predictable.
+const MAX_UPLOAD_CHUNK_B64_BYTES: u64 = 1024 * 1024;
+/// At the normal ~60 KiB relay size, a maximum-size upload needs fewer than
+/// 750 chunks. Keep modest retry/headroom while preventing a staging directory
+/// full of zero-byte chunks from allocating an unbounded path vector.
+const MAX_UPLOAD_CHUNKS: usize = 1024;
+/// Maximum encoded representation of a file at `MAX_BYTES` (without optional
+/// surrounding whitespace, which is rejected/conservatively counted).
+const MAX_ENCODED_BYTES: u64 = MAX_BYTES.div_ceil(3) * 4;
 /// Multiple of 3 so independent base64 chunks concatenate losslessly.
 const READ_CHUNK_BYTES: u64 = 45_000;
 
@@ -74,6 +88,9 @@ impl Uploads {
     /// double-appending. Callers without `seq` get append-only behavior.
     pub fn append(&self, upload_id: &str, data: &str, seq: Option<u64>) -> Result<(), EngineError> {
         let dir = self.staging_dir(upload_id)?;
+        if data.len() as u64 > MAX_UPLOAD_CHUNK_B64_BYTES {
+            return Err(EngineError::Other("Upload chunk is too large".into()));
+        }
         self.sweep();
         std::fs::create_dir_all(&dir)?;
         let at = match seq {
@@ -84,12 +101,24 @@ impl Uploads {
             return Err(EngineError::Other("Invalid chunk index".into()));
         }
         // Base64 inflates by ~4/3; bound the staged payload against the file cap.
-        let staged: u64 = chunk_files(&dir)?
-            .iter()
-            .filter(|(seq, _)| *seq != at)
-            .map(|(_, path)| std::fs::metadata(path).map(|m| m.len()).unwrap_or(0))
-            .sum();
-        if (staged + data.len() as u64) * 3 / 4 > MAX_BYTES {
+        let mut staged = 0u64;
+        let parts = chunk_files(&dir)?;
+        if parts.len() >= MAX_UPLOAD_CHUNKS && !parts.iter().any(|(seq, _)| *seq == at) {
+            return Err(EngineError::Other("Upload has too many chunks".into()));
+        }
+        for (seq, path) in parts {
+            if seq == at {
+                continue;
+            }
+            let size = std::fs::metadata(path)?.len();
+            staged = staged
+                .checked_add(size)
+                .ok_or_else(|| EngineError::Other("Upload too large".into()))?;
+        }
+        let staged_with_chunk = staged
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| EngineError::Other("Upload too large".into()))?;
+        if staged_with_chunk > MAX_ENCODED_BYTES {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(EngineError::Other("Upload too large".into()));
         }
@@ -108,25 +137,54 @@ impl Uploads {
         parts.sort_by_key(|(seq, _)| *seq);
         // Positional appends may leave holes if a chunk never arrived — joining
         // around them would silently corrupt the file.
-        let mut joined = String::new();
-        for (i, (seq, path)) in parts.iter().enumerate() {
+        for (i, (seq, _path)) in parts.iter().enumerate() {
             if *seq != i as u64 {
                 return Err(EngineError::Other("Upload is missing a chunk".into()));
             }
-            joined.push_str(std::fs::read_to_string(path)?.trim());
-        }
-        let bytes = BASE64
-            .decode(joined.as_bytes())
-            .map_err(|e| EngineError::Other(format!("upload is not valid base64: {e}")))?;
-        if bytes.len() as u64 > MAX_BYTES {
-            let _ = std::fs::remove_dir_all(&dir);
-            return Err(EngineError::Other("Upload too large".into()));
         }
         std::fs::create_dir_all(&self.inner.dir)?;
         let name = sanitize(file_name);
         let id8: String = upload_id.chars().take(8).collect();
         let path = self.inner.dir.join(format!("{id8}-{name}"));
-        std::fs::write(&path, &bytes)?;
+        // Decode incrementally instead of joining every base64 chunk and then
+        // allocating a second full decoded `Vec`. The staged input is already
+        // bounded to 32 MiB, but the old approach still held roughly 75 MiB of
+        // transient buffers for one upload. A small carry preserves quartets
+        // that straddle chunk boundaries.
+        let temporary = self
+            .inner
+            .dir
+            .join(format!(".{id8}-{name}.{}.part", std::process::id()));
+        let result = decode_chunks_to_file(&parts, &temporary);
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&temporary);
+            // Invalid or oversized input is not recoverable by appending more
+            // chunks. Drop the staging directory so a failed upload cannot
+            // pin its full allowance until the TTL sweep runs.
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(error);
+        }
+        // Replace the destination only after the complete decoded file is
+        // durable. This avoids exposing a partially decoded attachment to a
+        // concurrent agent read when validation fails.
+        if let Err(error) = std::fs::rename(&temporary, &path) {
+            // `rename` replaces an existing file atomically on Unix but fails
+            // with `AlreadyExists` on Windows. Preserve the old retry/overwrite
+            // behavior for a reused upload id while keeping the normal path
+            // atomic on platforms that support replacement.
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                if let Err(replace_error) = (|| -> Result<(), std::io::Error> {
+                    std::fs::remove_file(&path)?;
+                    std::fs::rename(&temporary, &path)
+                })() {
+                    let _ = std::fs::remove_file(&temporary);
+                    return Err(replace_error.into());
+                }
+            } else {
+                let _ = std::fs::remove_file(&temporary);
+                return Err(error.into());
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
         Ok(path.to_string_lossy().to_string())
     }
@@ -237,6 +295,63 @@ impl Uploads {
     }
 }
 
+fn decode_chunks_to_file(parts: &[(u64, PathBuf)], destination: &Path) -> Result<(), EngineError> {
+    // Validate metadata before opening the destination. This keeps malformed
+    // staging files from creating a partial output and bounds every
+    // subsequent `read_to_string` allocation.
+    let mut encoded_total = 0u64;
+    for (_, path) in parts {
+        let size = std::fs::metadata(path)?.len();
+        if size > MAX_UPLOAD_CHUNK_B64_BYTES {
+            return Err(EngineError::Other("Upload chunk is too large".into()));
+        }
+        encoded_total = encoded_total
+            .checked_add(size)
+            .ok_or_else(|| EngineError::Other("Upload too large".into()))?;
+        if encoded_total > MAX_ENCODED_BYTES {
+            return Err(EngineError::Other("Upload too large".into()));
+        }
+    }
+    let mut output = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(destination)?;
+    let mut carry = String::new();
+    let mut decoded_total = 0u64;
+
+    for (_, path) in parts {
+        let chunk = std::fs::read_to_string(path)?;
+        carry.push_str(chunk.trim());
+        let complete_len = carry.len() / 4 * 4;
+        if complete_len == 0 {
+            continue;
+        }
+        let decoded = BASE64
+            .decode(carry.as_bytes().get(..complete_len).unwrap_or_default())
+            .map_err(|error| EngineError::Other(format!("upload is not valid base64: {error}")))?;
+        decoded_total = decoded_total.saturating_add(decoded.len() as u64);
+        if decoded_total > MAX_BYTES {
+            return Err(EngineError::Other("Upload too large".into()));
+        }
+        output.write_all(&decoded)?;
+        carry.drain(..complete_len);
+    }
+
+    if !carry.is_empty() {
+        let decoded = BASE64
+            .decode(carry.as_bytes())
+            .map_err(|error| EngineError::Other(format!("upload is not valid base64: {error}")))?;
+        decoded_total = decoded_total.saturating_add(decoded.len() as u64);
+        if decoded_total > MAX_BYTES {
+            return Err(EngineError::Other("Upload too large".into()));
+        }
+        output.write_all(&decoded)?;
+    }
+    output.flush()?;
+    Ok(())
+}
+
 struct InspectedFile {
     resolved: PathBuf,
     name: String,
@@ -258,6 +373,9 @@ fn chunk_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, EngineError> {
         if let Some(seq) = seq
             && path.extension().and_then(|e| e.to_str()) == Some("b64")
         {
+            if files.len() >= MAX_UPLOAD_CHUNKS {
+                return Err(EngineError::Other("Upload has too many chunks".into()));
+            }
             files.push((seq, path));
         }
     }
@@ -265,11 +383,16 @@ fn chunk_files(dir: &Path) -> Result<Vec<(u64, PathBuf)>, EngineError> {
 }
 
 fn next_free_seq(dir: &Path) -> Result<u64, EngineError> {
-    Ok(chunk_files(dir)?
-        .iter()
-        .map(|(seq, _)| seq + 1)
-        .max()
-        .unwrap_or(0))
+    let files = chunk_files(dir)?;
+    if files.len() >= MAX_UPLOAD_CHUNKS {
+        return Err(EngineError::Other("Upload has too many chunks".into()));
+    }
+    files.iter().try_fold(0, |next, (seq, _)| {
+        let candidate = seq
+            .checked_add(1)
+            .ok_or_else(|| EngineError::Other("Invalid chunk index".into()))?;
+        Ok(next.max(candidate))
+    })
 }
 
 fn sanitize(file_name: &str) -> String {
@@ -319,6 +442,10 @@ fn mime_by_ext(path: &Path) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
     use super::*;
 
     #[test]
@@ -326,5 +453,135 @@ mod tests {
         assert_eq!(sanitize("../../etc/passwd"), "passwd");
         assert_eq!(sanitize("my photo (1).png"), "my_photo__1_.png");
         assert_eq!(sanitize(""), "upload");
+    }
+
+    #[test]
+    fn decode_chunks_streams_across_non_quartet_boundaries() {
+        let directory = tempdir().unwrap();
+        let first = directory.path().join("000000.b64");
+        let second = directory.path().join("000001.b64");
+        // "hello world" encoded as two deliberately awkward fragments.
+        fs::write(&first, "aGVsb").unwrap();
+        fs::write(&second, "G8gd29ybGQ=").unwrap();
+        let destination = directory.path().join("decoded.bin");
+
+        decode_chunks_to_file(&[(0, first), (1, second)], &destination).unwrap();
+
+        assert_eq!(fs::read(destination).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn decode_chunks_rejects_invalid_base64_without_panicking() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("000000.b64");
+        fs::write(&source, "not base64!").unwrap();
+        let error =
+            decode_chunks_to_file(&[(0, source)], &directory.path().join("out")).unwrap_err();
+        assert!(error.to_string().contains("not valid base64"));
+    }
+
+    #[test]
+    fn commit_decodes_staged_chunks_without_joining_the_input() {
+        let directory = tempdir().unwrap();
+        let uploads = Uploads::new(directory.path());
+        let data = b"streamed upload payload";
+        let encoded = BASE64.encode(data);
+        let split = 7;
+        uploads
+            .append("upload-1", &encoded[..split], Some(0))
+            .unwrap();
+        uploads
+            .append("upload-1", &encoded[split..], Some(1))
+            .unwrap();
+
+        let path = uploads.commit("upload-1", "payload.bin").unwrap();
+        assert_eq!(fs::read(path).unwrap(), data);
+        assert!(!directory.path().join("uploads/tmp/upload-1").exists());
+    }
+
+    #[test]
+    fn append_rejects_an_oversized_chunk_before_creating_staging() {
+        let directory = tempdir().unwrap();
+        let uploads = Uploads::new(directory.path());
+        let oversized = "A".repeat(MAX_UPLOAD_CHUNK_B64_BYTES as usize + 1);
+
+        let error = uploads
+            .append("too-large", &oversized, Some(0))
+            .unwrap_err();
+
+        assert!(error.to_string().contains("chunk is too large"));
+        assert!(!directory.path().join("uploads/tmp/too-large").exists());
+    }
+
+    #[test]
+    fn commit_cleans_invalid_staging_after_decode_failure() {
+        let directory = tempdir().unwrap();
+        let uploads = Uploads::new(directory.path());
+        uploads
+            .append("bad-upload", "not base64!", Some(0))
+            .unwrap();
+
+        let error = uploads.commit("bad-upload", "payload.bin").unwrap_err();
+
+        assert!(error.to_string().contains("not valid base64"));
+        assert!(!directory.path().join("uploads/tmp/bad-upload").exists());
+    }
+
+    #[test]
+    fn commit_rejects_oversized_staged_chunk_and_cleans_staging() {
+        let directory = tempdir().unwrap();
+        let uploads = Uploads::new(directory.path());
+        let staging = directory.path().join("uploads/tmp/forged-upload");
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(
+            staging.join("000000.b64"),
+            vec![b'A'; MAX_UPLOAD_CHUNK_B64_BYTES as usize + 1],
+        )
+        .unwrap();
+
+        let error = uploads.commit("forged-upload", "payload.bin").unwrap_err();
+
+        assert!(error.to_string().contains("chunk is too large"));
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn staged_chunk_count_is_hard_bounded_but_existing_slots_remain_idempotent() {
+        let directory = tempdir().unwrap();
+        let uploads = Uploads::new(directory.path());
+        let staging = directory.path().join("uploads/tmp/many-chunks");
+        fs::create_dir_all(&staging).unwrap();
+        for seq in 0..MAX_UPLOAD_CHUNKS {
+            fs::write(staging.join(format!("{seq:06}.b64")), []).unwrap();
+        }
+
+        // An implicit append would allocate another path and must stop at the
+        // hard count, while retrying/replacing an existing positional slot is
+        // still idempotent at the boundary.
+        assert!(next_free_seq(&staging).is_err());
+        uploads
+            .append("many-chunks", "YQ==", Some(0))
+            .expect("replace existing slot at count limit");
+        let error = uploads
+            .append("many-chunks", "Yg==", Some(MAX_UPLOAD_CHUNKS as u64))
+            .unwrap_err();
+        assert!(error.to_string().contains("too many chunks"));
+
+        // A forged extra file is rejected during commit enumeration before a
+        // path vector can grow past the same bound. Removing it restores a
+        // valid exact-boundary upload.
+        let extra = staging.join(format!("{:06}.b64", MAX_UPLOAD_CHUNKS));
+        fs::write(&extra, []).unwrap();
+        assert!(
+            uploads
+                .commit("many-chunks", "payload.bin")
+                .unwrap_err()
+                .to_string()
+                .contains("too many chunks")
+        );
+        fs::remove_file(extra).unwrap();
+
+        let path = uploads.commit("many-chunks", "payload.bin").unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"a");
     }
 }

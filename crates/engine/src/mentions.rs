@@ -7,31 +7,58 @@
 //! so restarts and crash recovery rebuild the same registry without extra
 //! state.
 
+use comet_doc::{DocError, SessionDoc};
+#[cfg(test)]
 use comet_doc::{MessagePart, MessageRole, SessionMessageEntry};
 use comet_proto::{DocumentRef, RunRequest, document_refs_from_text};
 
-/// Fold every `@`-ed document reference found in `entries` into `request`.
-///
-/// References attached to the current request (or parsed from its prompt)
-/// take precedence on `content_id` conflicts; older mentions are appended in
-/// transcript order and deduplicated by `content_id`.
-pub(crate) fn merge_resident_document_refs(
-    request: &mut RunRequest,
-    entries: &[SessionMessageEntry],
-) {
-    let mut merged: Vec<DocumentRef> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+const MAX_RESIDENT_DOCUMENT_REFS: usize = 128;
 
+fn append_text_refs(
+    text: &str,
+    merged: &mut Vec<DocumentRef>,
+    seen: &mut std::collections::HashSet<String>,
+) -> bool {
+    for reference in document_refs_from_text(text) {
+        if seen.insert(reference.content_id.clone()) {
+            merged.push(reference);
+            if merged.len() >= MAX_RESIDENT_DOCUMENT_REFS {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn request_refs(request: &RunRequest) -> (Vec<DocumentRef>, std::collections::HashSet<String>) {
+    let mut merged = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for reference in document_refs_from_text(&request.prompt)
         .into_iter()
         .chain(request.document_refs.iter().cloned())
     {
         if seen.insert(reference.content_id.clone()) {
             merged.push(reference);
+            if merged.len() >= MAX_RESIDENT_DOCUMENT_REFS {
+                break;
+            }
         }
     }
+    (merged, seen)
+}
 
-    for entry in entries {
+/// Fold every `@`-ed document reference found in `entries` into `request`.
+///
+/// References attached to the current request (or parsed from its prompt)
+/// take precedence on `content_id` conflicts; older mentions are appended in
+/// transcript order and deduplicated by `content_id`.
+#[cfg(test)]
+pub(crate) fn merge_resident_document_refs(
+    request: &mut RunRequest,
+    entries: &[SessionMessageEntry],
+) {
+    let (mut merged, mut seen) = request_refs(request);
+    'entries: for entry in entries {
         if entry.role != MessageRole::User {
             continue;
         }
@@ -39,15 +66,27 @@ pub(crate) fn merge_resident_document_refs(
             let MessagePart::Text { text, .. } = part else {
                 continue;
             };
-            for reference in document_refs_from_text(text) {
-                if seen.insert(reference.content_id.clone()) {
-                    merged.push(reference);
-                }
+            if !append_text_refs(text, &mut merged, &mut seen) {
+                break 'entries;
             }
         }
     }
-
     request.document_refs = merged;
+}
+
+/// Rebuild the resident document registry directly from the CRDT. Historical
+/// message bodies are decoded one at a time and the scan stops at the hard
+/// request budget, instead of materializing the complete transcript first.
+pub(crate) fn merge_resident_document_refs_from_doc(
+    request: &mut RunRequest,
+    doc: &SessionDoc,
+) -> Result<(), DocError> {
+    let (mut merged, mut seen) = request_refs(request);
+    if merged.len() < MAX_RESIDENT_DOCUMENT_REFS {
+        doc.visit_user_text_parts(|text| append_text_refs(text, &mut merged, &mut seen))?;
+    }
+    request.document_refs = merged;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -168,5 +207,49 @@ mod tests {
         assert_eq!(request.document_refs.len(), 2);
         assert_eq!(request.document_refs[0].content_id, "c1");
         assert_eq!(request.document_refs[1].content_id, "c2");
+    }
+
+    #[test]
+    fn doc_scan_reads_user_parts_without_materializing_a_transcript() {
+        let doc = SessionDoc::init("chat").unwrap();
+        doc.push_message(&text_entry(
+            "u1",
+            MessageRole::User,
+            "@[需求文档](aurin://doc/n1/c1)",
+        ))
+        .unwrap();
+        doc.push_message(&text_entry(
+            "a1",
+            MessageRole::Assistant,
+            "@[不应驻留](aurin://doc/n2/c2)",
+        ))
+        .unwrap();
+        let mut request = request("继续");
+        merge_resident_document_refs_from_doc(&mut request, &doc).unwrap();
+
+        assert_eq!(request.document_refs.len(), 1);
+        assert_eq!(request.document_refs[0].content_id, "c1");
+    }
+
+    #[test]
+    fn resident_registry_is_hard_bounded() {
+        let doc = SessionDoc::init("chat").unwrap();
+        for index in 0..(MAX_RESIDENT_DOCUMENT_REFS + 32) {
+            doc.push_message(&text_entry(
+                &format!("u{index}"),
+                MessageRole::User,
+                &format!("@[doc {index}](aurin://doc/n{index}/c{index})"),
+            ))
+            .unwrap();
+        }
+        let mut request = request("继续");
+        merge_resident_document_refs_from_doc(&mut request, &doc).unwrap();
+
+        assert_eq!(request.document_refs.len(), MAX_RESIDENT_DOCUMENT_REFS);
+        assert_eq!(request.document_refs[0].content_id, "c0");
+        assert_eq!(
+            request.document_refs.last().unwrap().content_id,
+            format!("c{}", MAX_RESIDENT_DOCUMENT_REFS - 1)
+        );
     }
 }

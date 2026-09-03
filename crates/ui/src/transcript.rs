@@ -23,7 +23,7 @@
 //! inside the 70px band; own-send re-engages with the same glide.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -79,6 +79,16 @@ const FOLD_TWEEN_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 pub const ATT_THUMB_W: f32 = 112.0;
 pub const ATT_THUMB_H: f32 = 80.0;
 pub const ATT_STRIP_H: f32 = ATT_THUMB_H + 10.0;
+
+/// Historical transcript rows remain durable in the document, but their
+/// parsed/rendered representations are only a re-computable UI cache. Keep a
+/// bounded recent window so a very long chat cannot retain one markdown tree,
+/// highlight result, and shaped-run cache entry for every message forever.
+const CACHE_RECENT_ROWS: usize = 512;
+const CACHE_MAX_TREE_PARTS: usize = 512;
+const CACHE_MAX_TREE_BYTES: usize = 32 * 1024 * 1024;
+const CACHE_MAX_HIGHLIGHT_ENTRIES: usize = 256;
+const CACHE_MAX_HIGHLIGHT_BYTES: usize = 8 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Stick-to-bottom spring (mugen §1e — same constants as its DEFAULT_SPRING,
@@ -198,11 +208,9 @@ pub struct ToolItem {
 #[derive(Clone)]
 pub enum RowKind {
     User {
-        /// Visible prompt (attachment-ref trailer already stripped).
+        /// Visible prompt and canonical markdown source (attachment-ref trailer
+        /// already stripped). One shared handle serves both purposes.
         text: SharedString,
-        /// Markdown blocks of the visible prompt (document mentions render
-        /// as capsules through the same renderer as assistant replies).
-        tree: Arc<BlockTree>,
         /// Image refs parsed out of the message text (message-attachments.ts):
         /// thumbnails load from the owning device via ReadAttachmentChunk.
         attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
@@ -211,7 +219,11 @@ pub enum RowKind {
     },
     /// One top-level markdown block of a completed message.
     Markdown {
-        tree: Arc<BlockTree>,
+        /// Stable cache/source identity for this complete text part.
+        part_key: SharedString,
+        /// Canonical markdown source. Rows retain source text, never its parsed
+        /// AST; all block rows from one part share this allocation.
+        source: SharedString,
         block_ix: usize,
     },
     /// One top-level block of a STREAMING message. Split per block like
@@ -219,7 +231,8 @@ pub enum RowKind {
     /// the settled prefix is never respliced or re-rendered); rendered with
     /// the fade veil.
     LiveMarkdown {
-        tree: Arc<BlockTree>,
+        part_key: SharedString,
+        source: SharedString,
         block_ix: usize,
     },
     ToolGroup {
@@ -322,14 +335,17 @@ pub fn rows_for_entry(
         // Attachment refs ride the plain text (the `withAttachments`
         // transport); split them back out for the thumbnail strip.
         let parsed = crate::attachments::parse_user_message_images(&raw);
-        let tree = parse(entry_id.as_ref(), &parsed.text);
+        let text: SharedString = parsed.text.into();
+        // Parse now to preserve the existing row-building contract (the
+        // resulting tree is cached or immediately evictable); the row itself
+        // keeps only the shared source.
+        let _ = parse(entry_id.as_ref(), text.as_ref());
         return vec![Row {
             id: entry.id.clone().into(),
             version: (raw.len() as u64) << 1 | pending as u64,
             turn_start: true,
             kind: RowKind::User {
-                text: parsed.text.into(),
-                tree,
+                text,
                 attachments: Arc::new(parsed.attachments),
                 pending,
             },
@@ -395,7 +411,9 @@ pub fn rows_for_entry(
                             continue;
                         }
                         let key = format!("{}#{}", entry.id, part_id);
-                        let tree = parse(&key, text);
+                        let part_key: SharedString = key.clone().into();
+                        let source: SharedString = text.clone().into();
+                        let tree = parse(&key, source.as_ref());
                         // Live and completed parts split identically — one row
                         // per top-level block, same ids, so the live→complete
                         // handoff never changes row identity. The version is a
@@ -419,12 +437,14 @@ pub fn rows_for_entry(
                                 timestamp: None,
                                 kind: if streaming {
                                     RowKind::LiveMarkdown {
-                                        tree: tree.clone(),
+                                        part_key: part_key.clone(),
+                                        source: source.clone(),
                                         block_ix,
                                     }
                                 } else {
                                     RowKind::Markdown {
-                                        tree: tree.clone(),
+                                        part_key: part_key.clone(),
+                                        source: source.clone(),
                                         block_ix,
                                     }
                                 },
@@ -564,6 +584,117 @@ pub enum ParseOutcome {
     Full,
 }
 
+struct ParsedTreeEntry {
+    source_len: usize,
+    /// Completed sources carry a content hash so equal-length rewrites cannot
+    /// hit a stale tree. A live tree is replaced on every commit by the owning
+    /// incremental parser, so hashing the whole growing source there would add
+    /// O(total reply length) work to every token append for no safety gain.
+    source_hash: Option<u64>,
+    tree: Arc<BlockTree>,
+    /// Live trees are pinned by `live_parsers` and intentionally unmetered.
+    /// Measuring them on every append would recursively walk the full tree;
+    /// completion replaces the entry with a measured settled tree exactly once.
+    heap_bytes: usize,
+}
+
+/// Parsed markdown is a bounded, evictable UI cache. It owns its LRU and an
+/// insertion-time byte total so enforcing the budget is O(evictions), not a
+/// recursive scan of every retained AST after every insertion.
+#[derive(Default)]
+pub struct ParsedTreeCache {
+    entries: HashMap<String, ParsedTreeEntry>,
+    order: VecDeque<String>,
+    heap_bytes: usize,
+}
+
+impl ParsedTreeCache {
+    fn get_matching(
+        &mut self,
+        key: &str,
+        source_len: usize,
+        source_hash: Option<u64>,
+    ) -> Option<Arc<BlockTree>> {
+        let tree = self.entries.get(key).and_then(|entry| {
+            (entry.source_len == source_len
+                && match (source_hash, entry.source_hash) {
+                    (Some(expected), Some(actual)) => expected == actual,
+                    // Live entries are replaced synchronously by
+                    // `parse_for_row` before their rows can render.
+                    (None, None) => true,
+                    _ => false,
+                })
+            .then(|| entry.tree.clone())
+        })?;
+        self.touch(key);
+        Some(tree)
+    }
+
+    fn insert(
+        &mut self,
+        key: &str,
+        source_len: usize,
+        source_hash: Option<u64>,
+        tree: Arc<BlockTree>,
+    ) {
+        let heap_bytes = source_hash.map_or(0, |_| tree.heap_bytes());
+        let entry = ParsedTreeEntry {
+            source_len,
+            source_hash,
+            tree,
+            heap_bytes,
+        };
+        if let Some(previous) = self.entries.insert(key.to_owned(), entry) {
+            self.heap_bytes = self.heap_bytes.saturating_sub(previous.heap_bytes);
+        }
+        self.heap_bytes = self.heap_bytes.saturating_add(heap_bytes);
+        self.touch(key);
+    }
+
+    fn touch(&mut self, key: &str) {
+        if let Some(index) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(index);
+        }
+        self.order.push_back(key.to_owned());
+    }
+
+    fn remove(&mut self, key: &str) -> bool {
+        let Some(entry) = self.entries.remove(key) else {
+            return false;
+        };
+        self.heap_bytes = self.heap_bytes.saturating_sub(entry.heap_bytes);
+        true
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        let mut removed_bytes = 0usize;
+        self.entries.retain(|key, entry| {
+            let retain = keep(key);
+            if !retain {
+                removed_bytes = removed_bytes.saturating_add(entry.heap_bytes);
+            }
+            retain
+        });
+        self.heap_bytes = self.heap_bytes.saturating_sub(removed_bytes);
+        self.order.retain(|key| self.entries.contains_key(key));
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.heap_bytes = 0;
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+}
+
 /// The transcript's markdown parse wiring, extracted for testability: one call
 /// per text part per sync. Streaming parts keep one [`IncrementalParser`] per
 /// row key and advance it with the full accumulated text (`set_text` takes the
@@ -575,26 +706,29 @@ pub fn parse_for_row(
     key: &str,
     text: &str,
     live_parsers: &mut HashMap<String, IncrementalParser>,
-    tree_cache: &mut HashMap<String, (usize, Arc<BlockTree>)>,
+    tree_cache: &mut ParsedTreeCache,
 ) -> (Arc<BlockTree>, ParseOutcome) {
     if streaming {
         let parser = live_parsers.entry(key.to_string()).or_default();
         parser.set_text(text);
+        let tree = Arc::new(parser.display_tree());
+        tree_cache.insert(key, text.len(), None, tree.clone());
         (
             // Display tree: hanging inline markers mended so closers arriving
             // later never reflow painted text (markdown/mend.rs). Completed
             // rows below use the canonical tree — the honest settle.
-            Arc::new(parser.display_tree()),
+            tree,
             ParseOutcome::Incremental {
                 parsed_bytes: parser.last_parse_bytes(),
                 stable_prefix_blocks: parser.stable_prefix_blocks(),
             },
         )
     } else {
-        if let Some((len, tree)) = tree_cache.get(key)
-            && *len == text.len()
+        let source_hash = fnv1a(text.as_bytes());
+        if !live_parsers.contains_key(key)
+            && let Some(tree) = tree_cache.get_matching(key, text.len(), Some(source_hash))
         {
-            return (tree.clone(), ParseOutcome::Cached);
+            return (tree, ParseOutcome::Cached);
         }
         // On the live→complete flip reuse the live parser's tree when
         // the sources match — the split rows then share the exact tree
@@ -605,7 +739,7 @@ pub fn parse_for_row(
             }
             _ => (Arc::new(parse_full(text)), ParseOutcome::Full),
         };
-        tree_cache.insert(key.to_string(), (text.len(), tree.clone()));
+        tree_cache.insert(key, text.len(), Some(source_hash), tree.clone());
         (tree, outcome)
     }
 }
@@ -614,6 +748,50 @@ pub fn parse_for_row(
 /// everything before the block index.
 fn part_prefix(id: &str) -> &str {
     id.rsplit_once('.').map(|(p, _)| p).unwrap_or(id)
+}
+
+/// Enforce the parsed-AST budget at insertion time. Live parts and the tree
+/// currently being handed to the row builder/renderer are pinned; a single
+/// oversized visible/live part may therefore exceed the soft byte budget, but
+/// unrelated historical trees never accumulate behind it.
+fn trim_tree_cache(
+    cache: &mut ParsedTreeCache,
+    live_parsers: &HashMap<String, IncrementalParser>,
+    preserve: Option<&str>,
+    max_parts: usize,
+    max_bytes: usize,
+) {
+    cache.order.retain(|key| cache.entries.contains_key(key));
+    while cache.len() > max_parts || cache.heap_bytes > max_bytes {
+        let mut removed = false;
+        let candidates = cache.order.len();
+        for _ in 0..candidates {
+            let Some(key) = cache.order.pop_front() else {
+                break;
+            };
+            if preserve == Some(key.as_str()) || live_parsers.contains_key(&key) {
+                cache.order.push_back(key);
+                continue;
+            }
+            if cache.remove(&key) {
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
+            break;
+        }
+    }
+}
+
+fn row_part_key(row: &Row) -> Option<&str> {
+    match &row.kind {
+        RowKind::User { text, .. } if !text.is_empty() => Some(row.id.as_ref()),
+        RowKind::Markdown { part_key, .. } | RowKind::LiveMarkdown { part_key, .. } => {
+            Some(part_key.as_ref())
+        }
+        _ => None,
+    }
 }
 
 /// Vertical gap opening `row` given its predecessor: turn gap at turn starts;
@@ -753,8 +931,44 @@ async fn yield_now() {
 
 struct HighlightEntry {
     code_len: usize,
+    row_version: u64,
     lines: Option<Arc<Vec<Vec<Token>>>>,
     _task: Option<Task<()>>,
+    heap_bytes: usize,
+}
+
+type HighlightKey = (SharedString, usize);
+
+fn highlight_lines_heap_bytes(lines: &Vec<Vec<Token>>) -> usize {
+    lines
+        .capacity()
+        .saturating_mul(std::mem::size_of::<Vec<Token>>())
+        .saturating_add(
+            lines
+                .iter()
+                .map(|line| line.capacity().saturating_mul(std::mem::size_of::<Token>()))
+                .sum::<usize>(),
+        )
+}
+
+fn pending_highlight_heap_bytes(code: &str, stale_bytes: usize) -> usize {
+    // Before tokenization completes the task owns the source plus growing token
+    // vectors. Reserve a conservative worst case (roughly one token per byte,
+    // Vec growth up to 2x) so many concurrent background jobs cannot exceed the
+    // budget by a large multiplier before their results reach `complete`.
+    let line_count = code.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    code.len()
+        .saturating_add(
+            code.len()
+                .saturating_mul(std::mem::size_of::<Token>())
+                .saturating_mul(2),
+        )
+        .saturating_add(
+            line_count
+                .saturating_mul(std::mem::size_of::<Vec<Token>>())
+                .saturating_mul(2),
+        )
+        .saturating_add(stale_bytes)
 }
 
 /// Cache of tokenized code blocks keyed by `(row id, block ix)`. Tokenization
@@ -762,30 +976,107 @@ struct HighlightEntry {
 /// run colors when they land.
 #[derive(Default)]
 struct HighlightStore {
-    entries: HashMap<(SharedString, usize), HighlightEntry>,
+    entries: HashMap<HighlightKey, HighlightEntry>,
+    order: VecDeque<HighlightKey>,
+    heap_bytes: usize,
 }
 
 impl HighlightStore {
+    fn touch(&mut self, key: &HighlightKey) {
+        if let Some(ix) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(ix);
+        }
+        self.order.push_back(key.clone());
+    }
+
+    fn insert(&mut self, key: HighlightKey, entry: HighlightEntry) {
+        let entry_bytes = entry.heap_bytes;
+        if let Some(previous) = self.entries.insert(key.clone(), entry) {
+            self.heap_bytes = self.heap_bytes.saturating_sub(previous.heap_bytes);
+        }
+        self.heap_bytes = self.heap_bytes.saturating_add(entry_bytes);
+        self.touch(&key);
+        self.trim(Some(&key));
+    }
+
+    fn trim(&mut self, preserve: Option<&HighlightKey>) {
+        self.order.retain(|key| self.entries.contains_key(key));
+        while self.entries.len() > CACHE_MAX_HIGHLIGHT_ENTRIES
+            || self.heap_bytes > CACHE_MAX_HIGHLIGHT_BYTES
+        {
+            let candidates = self.order.len();
+            let mut removed = false;
+            for _ in 0..candidates {
+                let Some(key) = self.order.pop_front() else {
+                    break;
+                };
+                if preserve == Some(&key) {
+                    self.order.push_back(key);
+                    continue;
+                }
+                if let Some(entry) = self.entries.remove(&key) {
+                    self.heap_bytes = self.heap_bytes.saturating_sub(entry.heap_bytes);
+                    removed = true;
+                    break;
+                }
+            }
+            if !removed {
+                break;
+            }
+        }
+    }
+
+    fn complete(
+        &mut self,
+        key: &HighlightKey,
+        row_version: u64,
+        code_len: usize,
+        lines: Vec<Vec<Token>>,
+    ) -> bool {
+        let heap_bytes = highlight_lines_heap_bytes(&lines);
+        let Some(entry) = self.entries.get_mut(key) else {
+            return false;
+        };
+        if entry.code_len != code_len || entry.row_version != row_version {
+            return false;
+        }
+        self.heap_bytes = self.heap_bytes.saturating_sub(entry.heap_bytes);
+        entry.lines = Some(Arc::new(lines));
+        entry.heap_bytes = heap_bytes;
+        self.heap_bytes = self.heap_bytes.saturating_add(heap_bytes);
+        self.touch(key);
+        self.trim(Some(key));
+        true
+    }
+
     /// Current tokens if ready; kicks a background tokenize when stale/missing.
     fn request(
         &mut self,
         row_id: SharedString,
+        row_version: u64,
         block_ix: usize,
         lang: Lang,
         code: &str,
         cx: &mut Context<Transcript>,
     ) -> Option<Arc<Vec<Vec<Token>>>> {
         let key = (row_id.clone(), block_ix);
-        if let Some(entry) = self.entries.get(&key)
-            && entry.code_len == code.len()
-        {
-            return entry.lines.clone();
+        let cached = self.entries.get(&key).and_then(|entry| {
+            (entry.code_len == code.len() && entry.row_version == row_version)
+                .then(|| entry.lines.clone())
+        });
+        if let Some(lines) = cached {
+            self.touch(&key);
+            return lines;
         }
         // Keep stale lines visible while the fresh parse runs (paint-only, so a
         // briefly stale color is harmless; lengths shift at most on the tail).
         let stale = self.entries.get(&key).and_then(|e| e.lines.clone());
         let code = code.to_string();
         let code_len = code.len();
+        let stale_bytes = stale
+            .as_deref()
+            .map_or(0, |lines| highlight_lines_heap_bytes(lines));
+        let pending_heap_bytes = pending_highlight_heap_bytes(&code, stale_bytes);
         let task = cx.spawn(async move |this, cx| {
             let lines = cx
                 .background_executor()
@@ -804,24 +1095,53 @@ impl HighlightStore {
                 })
                 .await;
             this.update(cx, |transcript, cx| {
-                if let Some(entry) = transcript.highlights.entries.get_mut(&key)
-                    && entry.code_len == code_len
+                if transcript
+                    .highlights
+                    .complete(&key, row_version, code_len, lines)
                 {
-                    entry.lines = Some(Arc::new(lines));
                     cx.notify();
                 }
             })
             .ok();
         });
-        self.entries.insert(
+        self.insert(
             (row_id, block_ix),
             HighlightEntry {
                 code_len,
+                row_version,
                 lines: stale.clone(),
                 _task: Some(task),
+                // The task owns `code` until tokenization completes; stale
+                // tokens, when any, remain resident alongside it.
+                heap_bytes: pending_heap_bytes,
             },
         );
         stale
+    }
+
+    /// Drop tokenized code blocks outside the recent transcript window and
+    /// enforce both an entry and source-byte budget. A code block is cheap to
+    /// tokenize again when it scrolls back into view; keeping all token rows is
+    /// not cheap for a long chat.
+    fn retain_recent_rows(&mut self, rows: &std::collections::HashSet<SharedString>) {
+        let mut removed_bytes = 0usize;
+        self.entries.retain(|(row_id, _), entry| {
+            if rows.contains(row_id) {
+                true
+            } else {
+                removed_bytes = removed_bytes.saturating_add(entry.heap_bytes);
+                false
+            }
+        });
+        self.heap_bytes = self.heap_bytes.saturating_sub(removed_bytes);
+        self.order.retain(|key| self.entries.contains_key(key));
+        self.trim(None);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.heap_bytes = 0;
     }
 }
 
@@ -829,9 +1149,35 @@ impl HighlightStore {
 // Transcript entity
 // ---------------------------------------------------------------------------
 
-struct CachedRows {
+#[derive(Clone)]
+struct EntryRows {
+    id: String,
     fingerprint: u64,
-    rows: Vec<Row>,
+    range: Range<usize>,
+}
+
+/// Memory/lifecycle counters for one transcript entity. These are deliberately
+/// derived from already-maintained lengths and byte totals, so sampling them
+/// never materializes markdown, clones a transcript, or walks image payloads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TranscriptMemoryDiagnostics {
+    pub transcript_entries: usize,
+    /// Lightweight row descriptors indexed by GPUI's virtual list. Only the
+    /// viewport plus overdraw is instantiated as elements by `list(...)`.
+    pub indexed_rows: usize,
+    pub indexed_entries: usize,
+    pub parsed_tree_parts: usize,
+    pub parsed_tree_bytes: usize,
+    pub live_parsers: usize,
+    pub highlight_entries: usize,
+    pub highlight_bytes: usize,
+    pub flat_render_entries: usize,
+    pub flat_render_bytes: usize,
+    pub code_render_entries: usize,
+    pub code_render_bytes: usize,
+    pub attachment_previews: usize,
+    pub attachment_loads: usize,
+    pub attachment_retries: usize,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -857,9 +1203,16 @@ pub struct Transcript {
     list: ListState,
     rows: Vec<Row>,
     chat_id: Option<String>,
-    row_cache: HashMap<String, CachedRows>,
+    /// Exact source snapshot that produced `rows`. Pointer identity lets state
+    /// notifications unrelated to the transcript bypass row reconciliation.
+    source_snapshot: Arc<[SessionMessageEntry]>,
+    echo_fingerprint: u64,
+    /// One compact entry -> row-range index. Rows themselves have exactly one
+    /// owner (`rows`); keeping a second Vec<Row> per settled message doubled
+    /// descriptor memory for long transcripts.
+    entry_rows: Vec<EntryRows>,
     live_parsers: HashMap<String, IncrementalParser>,
-    tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
+    tree_cache: ParsedTreeCache,
     folds: HashMap<SharedString, FoldState>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
@@ -924,6 +1277,43 @@ pub struct Transcript {
     _observe: Subscription,
 }
 
+/// Return a bounded, newest-first set of row ids used by the paint caches.
+/// Live rows are always included even when their stream is not at the tail.
+fn recent_cache_row_ids(rows: &[Row]) -> HashSet<SharedString> {
+    let mut ids = HashSet::with_capacity(CACHE_RECENT_ROWS);
+    for row in rows.iter().rev() {
+        if ids.len() < CACHE_RECENT_ROWS || matches!(row.kind, RowKind::LiveMarkdown { .. }) {
+            ids.insert(row.id.clone());
+        }
+    }
+    ids
+}
+
+fn row_sources_unchanged(
+    attached: bool,
+    previous_entries: &Arc<[SessionMessageEntry]>,
+    entries: &Arc<[SessionMessageEntry]>,
+    previous_echo_fingerprint: u64,
+    echo_fingerprint: u64,
+) -> bool {
+    !attached
+        && previous_echo_fingerprint == echo_fingerprint
+        && Arc::ptr_eq(previous_entries, entries)
+}
+
+fn unchanged_entry_prefix<'a>(
+    previous: &[EntryRows],
+    next: impl Iterator<Item = (&'a SessionMessageEntry, bool)>,
+) -> usize {
+    previous
+        .iter()
+        .zip(next)
+        .take_while(|(cached, (entry, pending))| {
+            cached.id == entry.id && cached.fingerprint == entry_fingerprint(entry, *pending)
+        })
+        .count()
+}
+
 impl Transcript {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         // FollowMode stays Normal: the tail pin is ours (a per-frame spring),
@@ -942,9 +1332,11 @@ impl Transcript {
             list,
             rows: Vec::new(),
             chat_id: None,
-            row_cache: HashMap::new(),
+            source_snapshot: Arc::from([]),
+            echo_fingerprint: 0,
+            entry_rows: Vec::new(),
             live_parsers: HashMap::new(),
-            tree_cache: HashMap::new(),
+            tree_cache: ParsedTreeCache::default(),
             folds: HashMap::new(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
@@ -1006,6 +1398,27 @@ impl Transcript {
 
     pub(crate) fn state_entity(&self) -> &Entity<AppState> {
         &self.state
+    }
+
+    pub fn memory_diagnostics(&self) -> TranscriptMemoryDiagnostics {
+        let render = self.render_cache.borrow().diagnostics();
+        TranscriptMemoryDiagnostics {
+            transcript_entries: self.source_snapshot.len(),
+            indexed_rows: self.rows.len(),
+            indexed_entries: self.entry_rows.len(),
+            parsed_tree_parts: self.tree_cache.entries.len(),
+            parsed_tree_bytes: self.tree_cache.heap_bytes,
+            live_parsers: self.live_parsers.len(),
+            highlight_entries: self.highlights.entries.len(),
+            highlight_bytes: self.highlights.heap_bytes,
+            flat_render_entries: render.flat_entries,
+            flat_render_bytes: render.flat_bytes,
+            code_render_entries: render.code_entries,
+            code_render_bytes: render.code_bytes,
+            attachment_previews: usize::from(self.attachment_preview.is_some()),
+            attachment_loads: self.attachment_loads.len(),
+            attachment_retries: self.attachment_retries.len(),
+        }
     }
 
     /// Replace the transcript's scroll animation task (rail click / jump).
@@ -1196,13 +1609,13 @@ impl Transcript {
         if attached {
             self.chat_id = selected;
             self.rows.clear();
-            self.row_cache.clear();
+            self.entry_rows.clear();
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
-            self.highlights.entries.clear();
+            self.highlights.clear();
             self.list.reset(0);
             self.pinned = true;
             self.spring.reset();
@@ -1212,12 +1625,55 @@ impl Transcript {
             self.show_jump_button = false;
         }
 
-        let mut new_rows: Vec<Row> = Vec::new();
-        for entry in entries.iter() {
-            new_rows.extend(self.rows_for(entry, false));
+        let echo_fingerprint = echoes.iter().fold(0u64, |acc, entry| {
+            acc.rotate_left(7) ^ entry_fingerprint(entry, true)
+        });
+        // AppState notifications are broader than transcript changes (theme,
+        // sidebar state, connection status, etc.). Once the same immutable
+        // snapshot and optimistic echo set have been reconciled, skip the
+        // O(number-of-rows) builder entirely. This is especially important
+        // after AST eviction: an unrelated notify must never reparse history.
+        if row_sources_unchanged(
+            attached,
+            &self.source_snapshot,
+            &entries,
+            self.echo_fingerprint,
+            echo_fingerprint,
+        ) {
+            return;
         }
-        for echo in &echoes {
-            new_rows.extend(self.rows_for(echo, true));
+
+        // Transcript documents are append-oriented. Find the first message
+        // whose cheap content fingerprint changed, retain the prefix in place,
+        // and rebuild only that message and the suffix. The common streaming
+        // path therefore parses and allocates one live entry rather than
+        // cloning every historical row on every token commit.
+        let sources = || {
+            entries
+                .iter()
+                .map(|entry| (entry, false))
+                .chain(echoes.iter().map(|entry| (entry, true)))
+        };
+        let unchanged_entries = if attached {
+            0
+        } else {
+            unchanged_entry_prefix(&self.entry_rows, sources())
+        };
+        let row_start = self
+            .entry_rows
+            .get(unchanged_entries)
+            .map_or(self.rows.len(), |entry| entry.range.start);
+        let mut replacement_rows = Vec::new();
+        let mut next_entry_rows = self.entry_rows[..unchanged_entries].to_vec();
+        for (entry, pending) in sources().skip(unchanged_entries) {
+            let start = row_start + replacement_rows.len();
+            replacement_rows.extend(self.build_rows(entry, pending));
+            let end = row_start + replacement_rows.len();
+            next_entry_rows.push(EntryRows {
+                id: entry.id.clone(),
+                fingerprint: entry_fingerprint(entry, pending),
+                range: start..end,
+            });
         }
 
         // Text already streamed before this (re)attach is the veil BASELINE:
@@ -1230,69 +1686,46 @@ impl Transcript {
             self.veil_baseline.clear();
             self.veil_attach_pending = true;
         }
-        if self.veil_attach_pending && !entries.is_empty() {
+        let was_empty = self.rows.is_empty();
+        let changed = match diff_rows(&self.rows[row_start..], &replacement_rows) {
+            None => false,
+            Some((old_range, count)) => {
+                let global_range = row_start + old_range.start..row_start + old_range.end;
+                // Any replaced row's cached flatten results are stale — and
+                // because live replies splice only the rows whose content hash
+                // changed (the tail), this is O(changed rows) per commit, never
+                // O(reply).
+                for row in &self.rows[global_range.clone()] {
+                    self.render_cache.borrow_mut().invalidate_row(&row.id);
+                }
+                let new_start = old_range.start;
+                let new_end = new_start + count;
+                self.rows.splice(
+                    global_range.clone(),
+                    replacement_rows[new_start..new_end].iter().cloned(),
+                );
+                self.list.splice(global_range, count);
+                true
+            }
+        };
+        self.entry_rows = next_entry_rows;
+        self.source_snapshot = entries;
+        self.echo_fingerprint = echo_fingerprint;
+
+        if self.veil_attach_pending && !self.source_snapshot.is_empty() {
             self.veil_attach_pending = false;
-            self.veil_baseline = new_rows
+            self.veil_baseline = self
+                .rows
                 .iter()
                 .filter(|r| matches!(r.kind, RowKind::LiveMarkdown { .. }))
                 .map(|r| r.id.clone())
                 .collect();
         }
+        self.prune_row_state();
 
-        // Veils live exactly as long as their live row — drop them on the
-        // live→complete flip (any mid-fade chunk snaps to full, matching the
-        // row's version splice).
-        {
-            let active_entry_ids = entries
-                .iter()
-                .chain(echoes.iter())
-                .map(|entry| entry.id.as_str())
-                .collect::<std::collections::HashSet<_>>();
-            self.row_cache
-                .retain(|entry_id, _| active_entry_ids.contains(entry_id.as_str()));
-
-            let active_row_ids = new_rows
-                .iter()
-                .map(|row| row.id.as_ref())
-                .collect::<std::collections::HashSet<&str>>();
-            let live_row_ids = new_rows
-                .iter()
-                .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
-                .map(|row| row.id.as_ref())
-                .collect::<std::collections::HashSet<&str>>();
-            self.live_parsers
-                .retain(|row_id, _| active_row_ids.contains(row_id.as_str()));
-            self.tree_cache
-                .retain(|row_id, _| active_row_ids.contains(row_id.as_str()));
-            self.highlights
-                .entries
-                .retain(|(row_id, _), _| active_row_ids.contains(row_id.as_ref()));
-            self.folds
-                .retain(|row_id, _| active_row_ids.contains(row_id.as_ref()));
-            self.veils
-                .retain(|row_id, _| live_row_ids.contains(row_id.as_ref()));
-            self.veil_baseline
-                .retain(|row_id| live_row_ids.contains(row_id.as_ref()));
+        if !changed {
+            return;
         }
-
-        let was_empty = self.rows.is_empty();
-        match diff_rows(&self.rows, &new_rows) {
-            None => {
-                self.rows = new_rows;
-                return;
-            }
-            Some((old_range, count)) => {
-                // Any replaced row's cached flatten results are stale — and
-                // because live replies splice only the rows whose content hash
-                // changed (the tail), this is O(changed rows) per commit, never
-                // O(reply).
-                for row in &self.rows[old_range.clone()] {
-                    self.render_cache.borrow_mut().invalidate_row(&row.id);
-                }
-                self.list.splice(old_range, count);
-            }
-        }
-        self.rows = new_rows;
         if self.pinned {
             if motion::reduced_motion(cx) || was_empty {
                 // First fill (chat open) lands at the bottom instantly
@@ -1310,36 +1743,111 @@ impl Transcript {
         cx.notify();
     }
 
-    /// Cached row build for one entry (streaming entries bypass the cache).
-    fn rows_for(&mut self, entry: &SessionMessageEntry, pending: bool) -> Vec<Row> {
+    /// Build one entry's lightweight row descriptors. Entry-level range reuse
+    /// in `sync` ensures this is called only for the changed transcript suffix.
+    fn build_rows(&mut self, entry: &SessionMessageEntry, pending: bool) -> Vec<Row> {
         let streaming = entry.status == Some(MessageStatus::Streaming);
-        let fingerprint = entry_fingerprint(entry, pending);
-        if !streaming
-            && let Some(cached) = self.row_cache.get(&entry.id)
-            && cached.fingerprint == fingerprint
-        {
-            return cached.rows.clone();
-        }
-
         let live_parsers = &mut self.live_parsers;
         let tree_cache = &mut self.tree_cache;
         let mut parse = |key: &str, text: &str| -> Arc<BlockTree> {
             // Render-cache invalidation rides on the row diff in `sync` (only
             // rows whose content hash changed are spliced — the reparsed tail).
-            parse_for_row(streaming, key, text, live_parsers, tree_cache).0
-        };
-        let rows = rows_for_entry(entry, pending, &mut parse);
-
-        if !streaming {
-            self.row_cache.insert(
-                entry.id.clone(),
-                CachedRows {
-                    fingerprint,
-                    rows: rows.clone(),
-                },
+            let tree = parse_for_row(streaming, key, text, live_parsers, tree_cache).0;
+            // Enforce the budget per part rather than after the entire history
+            // has been parsed. First-open peak RSS therefore stays close to the
+            // steady-state budget even for a very long transcript.
+            trim_tree_cache(
+                tree_cache,
+                live_parsers,
+                None,
+                CACHE_MAX_TREE_PARTS,
+                CACHE_MAX_TREE_BYTES,
             );
+            tree
+        };
+        rows_for_entry(entry, pending, &mut parse)
+    }
+
+    fn prune_row_state(&mut self) {
+        // Veils live exactly as long as their live row — drop them on the
+        // live→complete flip (any mid-fade chunk snaps to full, matching the
+        // row's version splice).
+        let active_row_ids = self
+            .rows
+            .iter()
+            .map(|row| row.id.as_ref())
+            .collect::<HashSet<_>>();
+        let recent_row_ids = recent_cache_row_ids(&self.rows);
+        let live_part_ids = self
+            .rows
+            .iter()
+            .filter_map(|row| match &row.kind {
+                RowKind::LiveMarkdown { part_key, .. } => Some(part_key.as_ref()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        // Parser state is keyed by the markdown PART (`entry#part`), not by a
+        // split row. Keep it while any live row references that part and drop
+        // it immediately after live->complete handoff.
+        self.live_parsers
+            .retain(|part_key, _| live_part_ids.contains(part_key.as_str()));
+        let active_part_ids = self
+            .rows
+            .iter()
+            .filter_map(row_part_key)
+            .collect::<HashSet<_>>();
+        self.tree_cache
+            .retain(|part_key| active_part_ids.contains(part_key));
+        trim_tree_cache(
+            &mut self.tree_cache,
+            &self.live_parsers,
+            None,
+            CACHE_MAX_TREE_PARTS,
+            CACHE_MAX_TREE_BYTES,
+        );
+        self.render_cache.borrow_mut().retain_rows(&recent_row_ids);
+        self.highlights.retain_recent_rows(&recent_row_ids);
+        let live_row_ids = self
+            .rows
+            .iter()
+            .filter(|row| matches!(row.kind, RowKind::LiveMarkdown { .. }))
+            .map(|row| row.id.as_ref())
+            .collect::<HashSet<_>>();
+        self.folds
+            .retain(|row_id, _| active_row_ids.contains(row_id.as_ref()));
+        self.veils
+            .retain(|row_id, _| live_row_ids.contains(row_id.as_ref()));
+        self.veil_baseline
+            .retain(|row_id| live_row_ids.contains(row_id.as_ref()));
+    }
+
+    /// Resolve a row's markdown tree from the bounded cache. Historical rows
+    /// keep only `source + part_key`, so a cache miss is a normal cold-path and
+    /// never changes row identity or list cardinality.
+    fn tree_for_render(&mut self, part_key: &str, source: &str, streaming: bool) -> Arc<BlockTree> {
+        let source_hash = (!streaming).then(|| fnv1a(source.as_bytes()));
+        if let Some(tree) = self
+            .tree_cache
+            .get_matching(part_key, source.len(), source_hash)
+        {
+            return tree;
         }
-        rows
+
+        let (tree, _) = parse_for_row(
+            streaming,
+            part_key,
+            source,
+            &mut self.live_parsers,
+            &mut self.tree_cache,
+        );
+        trim_tree_cache(
+            &mut self.tree_cache,
+            &self.live_parsers,
+            None,
+            CACHE_MAX_TREE_PARTS,
+            CACHE_MAX_TREE_BYTES,
+        );
+        tree
     }
 
     fn toggle_fold(&mut self, row_id: SharedString, tool_count: usize, auto_open: bool) {
@@ -1579,16 +2087,33 @@ impl Transcript {
         };
         let bottom_pad = if ix + 1 == self.rows.len() { 24.0 } else { 0.0 };
 
+        // Resolve the AST before matching `row.kind`, so the row model itself
+        // remains a compact source descriptor rather than an AST owner.
+        let render_tree = match &row.kind {
+            RowKind::User { text, .. } if !text.is_empty() => {
+                Some(self.tree_for_render(row.id.as_ref(), text.as_ref(), false))
+            }
+            RowKind::Markdown {
+                part_key, source, ..
+            } => Some(self.tree_for_render(part_key.as_ref(), source.as_ref(), false)),
+            RowKind::LiveMarkdown {
+                part_key, source, ..
+            } => Some(self.tree_for_render(part_key.as_ref(), source.as_ref(), true)),
+            _ => None,
+        };
+
         let inner: AnyElement = match &row.kind {
             RowKind::User {
                 text,
-                tree,
                 attachments,
                 pending,
+                ..
             } => {
                 let attachments = attachments.clone();
                 let text = text.clone();
-                let tree = tree.clone();
+                let Some(tree) = render_tree.as_ref() else {
+                    return gpui::Empty.into_any_element();
+                };
                 let pending = *pending;
                 // Attachment thumbnails ride ABOVE the bubble, right-aligned
                 // (chat-view.tsx RowView: UserAttachmentStrip then the text
@@ -1637,7 +2162,10 @@ impl Transcript {
                 }
                 column.into_any_element()
             }
-            RowKind::Markdown { tree, block_ix } => {
+            RowKind::Markdown { block_ix, .. } => {
+                let Some(tree) = render_tree.as_ref() else {
+                    return gpui::Empty.into_any_element();
+                };
                 let opts = RenderOptions {
                     row_key: row.id.clone(),
                     veil: None,
@@ -1645,7 +2173,8 @@ impl Transcript {
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                 };
-                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
+                let highlight =
+                    self.code_highlight_for(&row.id, row.version, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
                     return gpui::Empty.into_any_element();
                 };
@@ -1662,7 +2191,10 @@ impl Transcript {
                         .map(|v| v.as_slice()),
                 )
             }
-            RowKind::LiveMarkdown { tree, block_ix } => {
+            RowKind::LiveMarkdown { block_ix, .. } => {
+                let Some(tree) = render_tree.as_ref() else {
+                    return gpui::Empty.into_any_element();
+                };
                 // Per-appended-chunk fade veil (opacity only — layout commits
                 // instantly). Reduced motion renders with no veil at all.
                 // Baseline rows (text already streamed when the transcript
@@ -1687,7 +2219,8 @@ impl Transcript {
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
                 };
-                let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
+                let highlight =
+                    self.code_highlight_for(&row.id, row.version, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
                     return gpui::Empty.into_any_element();
                 };
@@ -1860,6 +2393,7 @@ impl Transcript {
     fn code_highlight_for(
         &mut self,
         row_id: &SharedString,
+        row_version: u64,
         tree: &Arc<BlockTree>,
         only: Option<usize>,
         cx: &mut Context<Self>,
@@ -1874,7 +2408,8 @@ impl Transcript {
             {
                 out.insert(
                     ix,
-                    self.highlights.request(row_id.clone(), ix, lang, code, cx),
+                    self.highlights
+                        .request(row_id.clone(), row_version, ix, lang, code, cx),
                 );
             }
         }
@@ -2311,7 +2846,7 @@ mod tests {
         // commits; the incremental path stays within a small multiple of the
         // final length regardless of N.
         let mut live_parsers = HashMap::new();
-        let mut tree_cache = HashMap::new();
+        let mut tree_cache = ParsedTreeCache::default();
         let paragraph = "A paragraph of streaming prose that keeps arriving.\n\n";
         let commits = 120usize;
         let mut text = String::new();
@@ -2363,6 +2898,295 @@ mod tests {
         // And the settled cache serves repeats with no work at all.
         let (_, outcome) = parse_for_row(false, "e1#p1", &text, &mut live_parsers, &mut tree_cache);
         assert_eq!(outcome, ParseOutcome::Cached);
+    }
+
+    #[test]
+    fn bounded_tree_cache_does_not_change_rows_and_reparses_only_the_cold_part() {
+        let markdown = "# Title\n\nparagraph\n\n```rust\nlet x = 1;\n```";
+        let entry = assistant(
+            "history",
+            MessageStatus::Complete,
+            vec![text_part("body", markdown)],
+        );
+        let mut live_parsers = HashMap::new();
+        let mut tree_cache = ParsedTreeCache::default();
+        let rows = {
+            let mut bounded_parse = |key: &str, text: &str| {
+                let tree = parse_for_row(false, key, text, &mut live_parsers, &mut tree_cache).0;
+                trim_tree_cache(&mut tree_cache, &live_parsers, Some(key), 1, usize::MAX);
+                tree
+            };
+            rows_for_entry(&entry, false, &mut bounded_parse)
+        };
+        let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids.len(), 3);
+
+        // Every block descriptor shares one source allocation; no source-sized
+        // String is copied per virtual-list row. Part keys are one SharedString
+        // value too (short keys may be stored inline by GPUI).
+        let mut source_ptr = None;
+        for row in &rows {
+            let RowKind::Markdown {
+                part_key,
+                source: row_source,
+                ..
+            } = &row.kind
+            else {
+                panic!("expected markdown row");
+            };
+            assert_eq!(row_source.as_ref(), markdown);
+            if let Some(pointer) = source_ptr {
+                assert_eq!(pointer, row_source.as_ref().as_ptr());
+            } else {
+                source_ptr = Some(row_source.as_ref().as_ptr());
+            }
+            assert_eq!(part_key.as_ref(), "history#body");
+        }
+
+        // A newer part evicts this tree, but the durable lightweight rows keep
+        // their ids and cardinality. Revisiting one old row reparses only its
+        // owning part and leaves the unrelated cached tree intact.
+        let (_, outcome) = parse_for_row(
+            false,
+            "new#body",
+            "newer paragraph",
+            &mut live_parsers,
+            &mut tree_cache,
+        );
+        assert_eq!(outcome, ParseOutcome::Full);
+        trim_tree_cache(
+            &mut tree_cache,
+            &live_parsers,
+            Some("new#body"),
+            1,
+            usize::MAX,
+        );
+        assert!(!tree_cache.contains_key("history#body"));
+        assert!(tree_cache.contains_key("new#body"));
+
+        let (_, outcome) = parse_for_row(
+            false,
+            "history#body",
+            markdown,
+            &mut live_parsers,
+            &mut tree_cache,
+        );
+        assert_eq!(outcome, ParseOutcome::Full);
+        assert!(tree_cache.contains_key("new#body"));
+        assert_eq!(
+            rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>(),
+            ids
+        );
+    }
+
+    #[test]
+    fn tree_cache_rejects_equal_length_rewrites() {
+        let mut live_parsers = HashMap::new();
+        let mut tree_cache = ParsedTreeCache::default();
+        let (_, outcome) = parse_for_row(false, "e#p", "one", &mut live_parsers, &mut tree_cache);
+        assert_eq!(outcome, ParseOutcome::Full);
+        let (_, outcome) = parse_for_row(false, "e#p", "two", &mut live_parsers, &mut tree_cache);
+        assert_eq!(outcome, ParseOutcome::Full);
+    }
+
+    #[test]
+    fn oversized_settled_tree_is_used_but_not_retained() {
+        let mut live_parsers = HashMap::new();
+        let mut tree_cache = ParsedTreeCache::default();
+        let source = "large historical paragraph".repeat(64);
+        let (tree, outcome) = parse_for_row(
+            false,
+            "history#body",
+            &source,
+            &mut live_parsers,
+            &mut tree_cache,
+        );
+        assert_eq!(outcome, ParseOutcome::Full);
+        assert!(!tree.blocks.is_empty());
+
+        // The current caller still owns `tree`; the recomputable cache is free
+        // to evict it even when it is the newest (and only) entry.
+        trim_tree_cache(&mut tree_cache, &live_parsers, None, usize::MAX, 0);
+        assert_eq!(tree_cache.len(), 0);
+        assert_eq!(tree_cache.heap_bytes, 0);
+        assert!(!tree.blocks.is_empty());
+    }
+
+    #[test]
+    fn entry_range_index_rebuilds_only_the_changed_suffix() {
+        let first = assistant(
+            "first",
+            MessageStatus::Complete,
+            vec![text_part("body", "settled one")],
+        );
+        let second = assistant(
+            "second",
+            MessageStatus::Complete,
+            vec![text_part("body", "settled two")],
+        );
+        let live = assistant(
+            "live",
+            MessageStatus::Streaming,
+            vec![text_part("body", "partial")],
+        );
+        let previous = vec![first.clone(), second.clone(), live.clone()];
+        let indexed = previous
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| EntryRows {
+                id: entry.id.clone(),
+                fingerprint: entry_fingerprint(entry, false),
+                range: index..index + 1,
+            })
+            .collect::<Vec<_>>();
+
+        let mut grown_live = live;
+        let MessagePart::Text { text, .. } = &mut grown_live.parts[0] else {
+            unreachable!();
+        };
+        text.push_str(" tail");
+        let next = [first, second, grown_live];
+        assert_eq!(
+            unchanged_entry_prefix(&indexed, next.iter().map(|entry| (entry, false))),
+            2,
+            "only the live tail entry should be rebuilt"
+        );
+    }
+
+    #[test]
+    fn unrelated_notifications_skip_row_reconciliation() {
+        let entries: Arc<[SessionMessageEntry]> = vec![assistant(
+            "stable",
+            MessageStatus::Complete,
+            vec![text_part("body", "unchanged")],
+        )]
+        .into();
+        let same_snapshot = entries.clone();
+        assert!(row_sources_unchanged(
+            false,
+            &entries,
+            &same_snapshot,
+            17,
+            17,
+        ));
+
+        // A real doc frame, echo change, or chat attachment still reconciles.
+        let equal_but_new_snapshot: Arc<[SessionMessageEntry]> = entries.to_vec().into();
+        assert!(!row_sources_unchanged(
+            false,
+            &entries,
+            &equal_but_new_snapshot,
+            17,
+            17,
+        ));
+        assert!(!row_sources_unchanged(
+            false,
+            &entries,
+            &same_snapshot,
+            17,
+            18,
+        ));
+        assert!(!row_sources_unchanged(
+            true,
+            &entries,
+            &same_snapshot,
+            17,
+            17,
+        ));
+    }
+
+    #[test]
+    fn highlight_cache_stays_bounded_without_sync_and_counts_token_capacity() {
+        let mut store = HighlightStore::default();
+        for ix in 0..(CACHE_MAX_HIGHLIGHT_ENTRIES + 64) {
+            store.insert(
+                (format!("history-{ix}").into(), 0),
+                HighlightEntry {
+                    code_len: 1,
+                    row_version: ix as u64,
+                    lines: None,
+                    _task: None,
+                    heap_bytes: 1,
+                },
+            );
+        }
+        assert!(store.entries.len() <= CACHE_MAX_HIGHLIGHT_ENTRIES);
+        assert_eq!(store.order.len(), store.entries.len());
+
+        // Token vectors can be much larger than their source code. Complete
+        // three real capacity-heavy results without a transcript sync and
+        // verify result landing itself enforces the byte budget.
+        let token_capacity = CACHE_MAX_HIGHLIGHT_BYTES
+            .saturating_div(std::mem::size_of::<Token>())
+            .saturating_div(2)
+            .saturating_add(1);
+        for ix in 0..3 {
+            let key = (format!("large-{ix}").into(), 0);
+            store.insert(
+                key.clone(),
+                HighlightEntry {
+                    code_len: 1,
+                    row_version: ix,
+                    lines: None,
+                    _task: None,
+                    heap_bytes: 1,
+                },
+            );
+            let mut line = Vec::with_capacity(token_capacity);
+            line.push(Token {
+                range: 0..1,
+                class: crate::markdown::highlight::TokenClass::Keyword,
+            });
+            let lines = vec![line];
+            assert!(store.complete(&key, ix, 1, lines));
+        }
+        assert!(store.heap_bytes <= CACHE_MAX_HIGHLIGHT_BYTES);
+        assert!(store.entries.len() <= CACHE_MAX_HIGHLIGHT_ENTRIES);
+        assert_eq!(
+            store.heap_bytes,
+            store
+                .entries
+                .values()
+                .map(|entry| entry.heap_bytes)
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn historical_live_parser_is_pinned_then_handed_off_and_released() {
+        let mut live_parsers = HashMap::new();
+        let mut tree_cache = ParsedTreeCache::default();
+        let live_source = "first\n\nsecond\n\nthird is still streaming";
+        parse_for_row(
+            true,
+            "old-live#body",
+            live_source,
+            &mut live_parsers,
+            &mut tree_cache,
+        );
+
+        // Make the live part the oldest LRU entry and pressure the cache with
+        // settled parts. Its parser/tree remain pinned even though it is not in
+        // the recent insertion window.
+        for ix in 0..8 {
+            let key = format!("settled-{ix}#body");
+            parse_for_row(false, &key, "settled", &mut live_parsers, &mut tree_cache);
+            trim_tree_cache(&mut tree_cache, &live_parsers, Some(&key), 2, usize::MAX);
+        }
+        trim_tree_cache(&mut tree_cache, &live_parsers, None, 1, usize::MAX);
+        assert!(live_parsers.contains_key("old-live#body"));
+        assert!(tree_cache.contains_key("old-live#body"));
+
+        let (_, outcome) = parse_for_row(
+            false,
+            "old-live#body",
+            live_source,
+            &mut live_parsers,
+            &mut tree_cache,
+        );
+        assert_eq!(outcome, ParseOutcome::Handoff);
+        assert!(!live_parsers.contains_key("old-live#body"));
+        assert!(tree_cache.heap_bytes > 0, "settled tree is measured once");
     }
 
     // ---- stick-to-bottom spring ----

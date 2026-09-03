@@ -4,7 +4,7 @@
 //! [`Frame::Other`], so a newer CLI never breaks parsing — we only read the
 //! fields the normalizer needs (spec: docs/research/harness.md).
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// One parsed stdout line.
@@ -198,6 +198,37 @@ pub(crate) struct ImageBlock {
     pub data: String,
 }
 
+#[derive(Serialize)]
+struct UserLine<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    message: UserLineMessage<'a>,
+    parent_tool_use_id: Option<()>,
+}
+
+#[derive(Serialize)]
+struct UserLineMessage<'a> {
+    role: &'static str,
+    content: Vec<UserLineContent<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum UserLineContent<'a> {
+    #[serde(rename = "image")]
+    Image { source: UserLineImageSource<'a> },
+    #[serde(rename = "text")]
+    Text { text: &'a str },
+}
+
+#[derive(Serialize)]
+struct UserLineImageSource<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    media_type: &'a str,
+    data: &'a str,
+}
+
 /// A stdin user turn whose content is an array of blocks: the attached images
 /// first, then the text — the standard Anthropic image+text message shape
 /// (verified against the real CLI: `--input-format stream-json` accepts image
@@ -206,26 +237,29 @@ pub(crate) fn user_message_line_with_images(text: &str, images: &[ImageBlock]) -
     if images.is_empty() {
         return user_message_line(text);
     }
-    let mut blocks: Vec<Value> = images
+    // Serialize borrowed base64 slices directly into the final JSON line.
+    // Building an intermediate `serde_json::Value` cloned every attachment and
+    // made three full copies coexist at the serialization high-water mark.
+    let mut content = images
         .iter()
-        .map(|img| {
-            json!({
-                "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": img.media_type,
-                    "data": img.data,
-                },
-            })
+        .map(|img| UserLineContent::Image {
+            source: UserLineImageSource {
+                kind: "base64",
+                media_type: &img.media_type,
+                data: &img.data,
+            },
         })
-        .collect();
-    blocks.push(json!({ "type": "text", "text": text }));
-    json!({
-        "type": "user",
-        "message": { "role": "user", "content": blocks },
-        "parent_tool_use_id": null,
+        .collect::<Vec<_>>();
+    content.push(UserLineContent::Text { text });
+    serde_json::to_string(&UserLine {
+        kind: "user",
+        message: UserLineMessage {
+            role: "user",
+            content,
+        },
+        parent_tool_use_id: None,
     })
-    .to_string()
+    .expect("serializing a Claude user line cannot fail")
 }
 
 /// Success reply to a CLI control request (`can_use_tool` allow/deny payloads).

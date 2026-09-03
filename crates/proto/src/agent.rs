@@ -134,10 +134,15 @@ pub struct DocumentRef {
 /// chat has referenced, so the engine can rebuild the same registry after a
 /// restart without extra state. Mentions are deduplicated by `content_id`.
 pub fn document_refs_from_text(text: &str) -> Vec<DocumentRef> {
+    const MAX_REFS: usize = 128;
+    const MAX_FIELD_BYTES: usize = 64 * 1024;
     const MARKER: &str = "](aurin://doc/";
     let mut refs = Vec::new();
     let mut seen = HashSet::new();
     for (start, _) in text.match_indices("@[") {
+        if refs.len() >= MAX_REFS {
+            break;
+        }
         let title_start = start + 2;
         let Some(title_len) = text[title_start..].find(']') else {
             continue;
@@ -155,6 +160,12 @@ pub fn document_refs_from_text(text: &str) -> Vec<DocumentRef> {
         let (Some(node_id), Some(content_id)) = (ids.next(), ids.next()) else {
             continue;
         };
+        if node_id.len() > MAX_FIELD_BYTES
+            || content_id.len() > MAX_FIELD_BYTES
+            || title_end.saturating_sub(title_start) > MAX_FIELD_BYTES
+        {
+            continue;
+        }
         if !seen.insert(content_id.to_owned()) {
             continue;
         }
